@@ -1,4 +1,5 @@
 #if os(iOS)
+import CMUXMobileCore
 import CmuxMobileShell
 import CmuxMobileSupport
 import SwiftUI
@@ -26,7 +27,32 @@ struct TerminalComposerView: View {
 
     var body: some View {
         composerSurface
-            .onAppear { focusField() }
+            .onAppear {
+                recordComposerEvent(.composerViewAppear)
+                focusField()
+            }
+            .onDisappear {
+                // COMPOSER: logged independently of `isComposerPresented`. A
+                // disappear with no matching `composerPresentedChanged a==0` is a
+                // view-recreation bug (the flag stayed true but SwiftUI rebuilt the
+                // view), not an intentional dismiss.
+                recordComposerEvent(.composerViewDisappear)
+            }
+            .onChange(of: isFieldFocused) { _, focused in
+                // COMPOSER: a focus-lost while the flag stayed presented and the
+                // view stayed mounted, yet the field reads empty, isolates the
+                // residual TextField/@FocusState render-blank case.
+                recordComposerEvent(.composerFieldFocusChanged, a: focused ? 1 : 0)
+            }
+    }
+
+    /// Record a composer diagnostic event into the store's structured log (DEBUG
+    /// dogfood builds only) so the "Send to agent" feedback pane exports it. A
+    /// no-op when no log is wired (release, or a host that does not set it).
+    private func recordComposerEvent(_ code: DiagnosticEventCode, a: Int? = nil) {
+        #if DEBUG
+        store.diagnosticLog?.record(DiagnosticEvent(code, a: a))
+        #endif
     }
 
     /// On iOS 26 the glass controls float in a `GlassEffectContainer` over the

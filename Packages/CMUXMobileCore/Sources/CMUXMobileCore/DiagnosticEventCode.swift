@@ -90,4 +90,40 @@ public enum DiagnosticEventCode: UInt16, Sendable, Codable, CaseIterable {
     /// sequence). Lets a dictation result be traced from `insertText` through to
     /// the byte path that reaches the Mac.
     case inputCommitRouted = 17
+
+    // MARK: iOS composer instrumentation (draft-disappears-on-keyboard-dismiss hunt)
+    //
+    // These five codes discriminate WHY the iMessage-style composer's draft
+    // vanishes after the keyboard opens then closes. The draft text itself lives
+    // in the store (`terminalInputText`), so the symptom must be one of: the
+    // `isComposerPresented` flag toggled off, the composer view torn down + rebuilt
+    // while the flag stayed true, the draft cleared at the store, or (the residual)
+    // a `TextField`/`@FocusState` render blank. Logging the flag, the draft length,
+    // and the composer view's appear/disappear *independently* of the flag lets a
+    // single captured trace name which one happened. Decode with
+    // `scripts/decode-ios-diagnostic.py`.
+
+    /// The store's `isComposerPresented` flag changed (store `didSet`). `a` = 1 if
+    /// the composer is now presented, else 0. An unexpected `a == 0` during a bare
+    /// keyboard dismiss is the "flag toggled off" cause.
+    case composerPresentedChanged = 18
+    /// The store's `terminalInputText` draft changed (store `didSet`). `a` = new
+    /// UTF-8 byte length; `b` = 1 if it just went to empty (a clear), else 0. A
+    /// clear (`b == 1`) with no submit/sign-out nearby is the "draft cleared at the
+    /// store" cause.
+    case composerInputTextChanged = 19
+    /// ``TerminalComposerView`` appeared (`.onAppear`). Logged independently of
+    /// ``composerPresentedChanged`` so a disappear/appear pair with no flag change
+    /// reveals a view-recreation bug (the flag stayed true but SwiftUI rebuilt the
+    /// view).
+    case composerViewAppear = 20
+    /// ``TerminalComposerView`` disappeared (`.onDisappear`). A disappear without a
+    /// matching ``composerPresentedChanged`` `a == 0` is a view-recreation bug, not
+    /// an intentional dismiss.
+    case composerViewDisappear = 21
+    /// The composer's text field focus changed (`@FocusState`). `a` = 1 focused,
+    /// else 0. A focus-lost (`a == 0`) while the flag stayed presented and the view
+    /// stayed mounted, yet the field reads empty, isolates the residual
+    /// `TextField`/`@FocusState` render-blank case.
+    case composerFieldFocusChanged = 22
 }

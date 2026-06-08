@@ -227,18 +227,18 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     /// magnifying-glass/clipboard glyphs, so at the shared 13pt it still loomed
     /// larger than its neighbors; 11pt brings it visually in line with them.
     private static let composerButtonSymbolConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .medium)
-    /// One compact horizontal inset applied to every button so the bar reads
-    /// tight and uniform. Each button then hugs its label/icon plus this inset.
-    private static let accessoryButtonContentInsets = NSDirectionalEdgeInsets(top: 5, leading: 6, bottom: 5, trailing: 6)
+    /// One comfortable horizontal inset applied to every button so the bar reads
+    /// tappable and uniform. Each button then hugs its label/icon plus this inset.
+    private static let accessoryButtonContentInsets = NSDirectionalEdgeInsets(top: 5, leading: 8, bottom: 5, trailing: 8)
     private static let accessoryButtonCornerRadius: CGFloat = 6
     private static let accessoryButtonHeight: CGFloat = 28
     /// Minimum (not fixed) button width. Text buttons (Tab, Esc, ^C, ^D) size to
     /// their intrinsic content width and only floor here so they hug their label
-    /// plus the compact inset; single-glyph modifiers/icons take a fixed width so
-    /// they stay uniform. Kept small so short keys do not read as oversized; the
-    /// touch target is comfortable because the 28pt height supplies vertical
-    /// area even when the visible width is tight.
-    private static let accessoryButtonMinWidth: CGFloat = 28
+    /// plus the comfortable inset; single-glyph modifiers/icons take a fixed width
+    /// so they stay uniform. Sized for a comfortable tap target; the 28pt height
+    /// supplies vertical area and this floor keeps short keys from reading as
+    /// cramped.
+    private static let accessoryButtonMinWidth: CGFloat = 38
     private static let accessoryButtonNormalBackground = UIColor(white: 0.35, alpha: 1)
     private var accessoryBackgroundLeadingConstraint: NSLayoutConstraint?
     private var accessoryBackgroundTrailingConstraint: NSLayoutConstraint?
@@ -299,9 +299,12 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             equalTo: container.safeAreaLayoutGuide.leadingAnchor,
             constant: Self.accessoryHorizontalInset
         )
+        // The bar scrolls horizontally, so the right edge runs flush to the
+        // screen (zero trailing inset). `updateAccessoryLayoutInsets` only adds a
+        // safe-area inset when the surface itself does not reach the window edge.
         let scrollTrailingConstraint = scrollView.trailingAnchor.constraint(
             equalTo: container.safeAreaLayoutGuide.trailingAnchor,
-            constant: -Self.accessoryHorizontalInset
+            constant: 0
         )
 
         NSLayoutConstraint.activate([
@@ -324,11 +327,13 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             scrollView.topAnchor.constraint(equalTo: container.topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
 
-            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 4),
-            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -4),
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 2),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -2),
             stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor, constant: -8),
-            stack.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -8),
+            // Zero trailing content padding so the last button runs to the screen
+            // edge when scrolled to the end (the bar scrolls horizontally).
+            stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            stack.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -4),
         ])
 
         accessoryBackgroundLeadingConstraint = backgroundLeadingConstraint
@@ -363,7 +368,10 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
         accessoryBackgroundLeadingConstraint?.constant = leftInset
         accessoryBackgroundTrailingConstraint?.constant = -rightInset
         accessoryDismissLeadingConstraint?.constant = Self.accessoryHorizontalInset + leftInset
-        accessoryScrollTrailingConstraint?.constant = -(Self.accessoryHorizontalInset + rightInset)
+        // Right edge runs flush to the surface edge: only honor the surface's own
+        // right offset from the window (when it does not span full width), not the
+        // bar's leading inset, so the rightmost button hugs the screen edge.
+        accessoryScrollTrailingConstraint?.constant = -rightInset
 
         if accessoryStackView != nil {
             terminalAccessoryToolbar.setNeedsLayout()

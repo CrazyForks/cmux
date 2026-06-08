@@ -1168,6 +1168,10 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// flush with the grid bottom (no gap) and its bottom rests on the keyboard
     /// edge (up) or above the home indicator (down).
     private weak var dockedToolbar: UIView?
+    /// Whether the SwiftUI composer currently owns the bottom edge + keyboard.
+    /// Combined with `keyboardHeight` to decide the docked bar's visibility: the
+    /// bar shows only while the keyboard is up and the composer is not active.
+    private var composerActive = false
     /// True once SwiftUI has dismantled the hosting representable for this
     /// surface. A dismantled surface performs no render, output, or
     /// accessibility work so a view SwiftUI has removed cannot keep driving the
@@ -1199,8 +1203,13 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         let keyboardFrameInView = convert(frameEnd, from: window)
         let overlap = max(0, bounds.maxY - keyboardFrameInView.minY)
         guard overlap != keyboardHeight else { return }
+        let wasDown = keyboardHeight == 0
         keyboardHeight = overlap
         inputProxy.setKeyboardShown(true)
+        // The bar is keyboard-tied: reveal it (and reserve its grid height) as the
+        // keyboard comes up. Done before the frame animation so it animates in
+        // with the keyboard instead of popping after.
+        if wasDown { updateDockedToolbarVisibility() }
         animateDockedToolbar(with: notification)
         setNeedsGeometrySync()
     }
@@ -1209,6 +1218,9 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         guard keyboardHeight != 0 else { return }
         keyboardHeight = 0
         inputProxy.setKeyboardShown(false)
+        // Keyboard going down hides the docked bar and releases its reserved grid
+        // height so the terminal reclaims the space.
+        updateDockedToolbarVisibility()
         animateDockedToolbar(with: notification)
         setNeedsGeometrySync()
         // No explicit scrollback request here: the grid grew, so the viewport
@@ -1225,6 +1237,9 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     public func debugSetKeyboardHeightForLayoutPreview(_ height: CGFloat) {
         keyboardHeight = max(0, height)
         inputProxy.setKeyboardShown(height > 0)
+        // Mirror the live keyboard-tied visibility so the preview shows the bar
+        // only when the synthetic keyboard is "up".
+        updateDockedToolbarVisibility()
         layoutDockedToolbar()
         setNeedsGeometrySync()
         setNeedsLayout()
@@ -1248,27 +1263,47 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         let toolbar = inputProxy.toolbarView
         addSubview(toolbar)
         dockedToolbar = toolbar
-        reservedToolbarHeight = Self.persistentToolbarHeight
+        // The bar is keyboard-tied: it shows only while the keyboard is up. At
+        // install the keyboard is down, so start hidden with no reserved grid
+        // height; `updateDockedToolbarVisibility()` reveals it on keyboard-up.
+        updateDockedToolbarVisibility()
         layoutDockedToolbar()
+    }
+
+    /// Whether the docked accessory bar should be on screen right now: only while
+    /// the software keyboard is up and the SwiftUI composer is not active (the
+    /// composer owns the bottom edge + keyboard when open). The bar is an input
+    /// accessory, so it hides when the keyboard is down.
+    private var dockedToolbarShouldBeVisible: Bool {
+        keyboardHeight > 0 && !composerActive
+    }
+
+    /// Reconcile the docked bar's visibility (and its reserved grid height) with
+    /// the current keyboard + composer state. Hiding the bar releases its reserved
+    /// height so the terminal grid reclaims that space; showing it reserves the
+    /// height again. Idempotent: a no-op when already in the target state.
+    private func updateDockedToolbarVisibility() {
+        let shouldShow = dockedToolbarShouldBeVisible
+        let reserved: CGFloat = shouldShow ? Self.persistentToolbarHeight : 0
+        guard dockedToolbar?.isHidden != !shouldShow || reservedToolbarHeight != reserved else { return }
+        dockedToolbar?.isHidden = !shouldShow
+        reservedToolbarHeight = reserved
+        setNeedsGeometrySync()
+        setNeedsLayout()
     }
 
     /// Hide or restore the docked accessory bar while the SwiftUI composer is
     /// open. The composer owns the bottom edge (and the keyboard) when active, so
-    /// the docked bar would otherwise collide with it above the keyboard. Hiding
-    /// it and releasing its reserved grid height lets the composer sit flush
-    /// below the terminal grid.
+    /// the docked bar would otherwise collide with it above the keyboard.
     public func setComposerActive(_ active: Bool) {
-        let reserved: CGFloat = active ? 0 : Self.persistentToolbarHeight
-        guard dockedToolbar?.isHidden != active || reservedToolbarHeight != reserved else { return }
-        dockedToolbar?.isHidden = active
-        reservedToolbarHeight = reserved
+        guard composerActive != active else { return }
+        composerActive = active
         // Deliberately do NOT resign the terminal input proxy here. The composer's
         // text field becomes first responder while this keyboard is still up, so
         // iOS hands the keyboard over in place. Resigning first tore the keyboard
         // down and the composer immediately re-summoned it (the visible
         // disappear/reappear flicker).
-        setNeedsGeometrySync()
-        setNeedsLayout()
+        updateDockedToolbarVisibility()
     }
 
     /// Full-width bar whose bottom sits on the keyboard (when up) or the very

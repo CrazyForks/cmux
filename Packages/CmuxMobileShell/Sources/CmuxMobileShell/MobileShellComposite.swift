@@ -201,11 +201,37 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// (dictation, autocorrect, keyboard/clipboard paste) fall back to per-key
     /// `terminal.input` instead of being dropped with `method_not_found`.
     public private(set) var supportsTerminalPaste: Bool = false
-    public var terminalInputText: String
+    public var terminalInputText: String {
+        didSet {
+            #if DEBUG
+            // COMPOSER: record every draft change so a captured trace shows whether
+            // the draft was cleared at the store (b == 1) during a keyboard-dismiss
+            // cycle, vs. only disappearing from the view. `didSet` does not fire on
+            // the `init` assignment, so this is safe to read `diagnosticLog`.
+            diagnosticLog?.record(DiagnosticEvent(
+                .composerInputTextChanged,
+                a: terminalInputText.utf8.count,
+                b: terminalInputText.isEmpty ? 1 : 0
+            ))
+            #endif
+        }
+    }
     /// Whether the iMessage-style composer is shown above the terminal. Toggled
     /// from the input accessory bar's composer button and observed by the
     /// terminal screen to present ``terminalInputText`` for multi-line editing.
-    public var isComposerPresented: Bool = false
+    public var isComposerPresented: Bool = false {
+        didSet {
+            #if DEBUG
+            // COMPOSER: record every flag change (the only mutation site is
+            // `toggleComposer`). An unexpected `a == 0` during a bare keyboard
+            // dismiss is the "flag toggled off" cause of the disappearing draft.
+            diagnosticLog?.record(DiagnosticEvent(
+                .composerPresentedChanged,
+                a: isComposerPresented ? 1 : 0
+            ))
+            #endif
+        }
+    }
     /// Guards ``submitComposerInput()`` against re-entrancy. A quick double tap
     /// on Send would otherwise start two sends that both capture the same text
     /// (the field is cleared only on ack), pasting the message to the agent

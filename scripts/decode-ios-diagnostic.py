@@ -45,6 +45,11 @@ EVENT_CODES = {
     15: ("inputDictationRemove", "a=willInsertResult"),
     16: ("inputBecomeFirstResponder", "a=became b=responderIdentity"),
     17: ("inputCommitRouted", "a=utf8Len b=commitSink"),
+    18: ("composerPresentedChanged", "a=presented"),
+    19: ("composerInputTextChanged", "a=draftUtf8Len b=cleared"),
+    20: ("composerViewAppear", ""),
+    21: ("composerViewDisappear", ""),
+    22: ("composerFieldFocusChanged", "a=focused"),
 }
 
 # InputResponderIdentity raw value -> name.
