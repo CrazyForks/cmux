@@ -7357,7 +7357,7 @@ final class TerminalSurface: Identifiable, ObservableObject {
         guard let fullFrame = try? JSONDecoder().decode(MobileTerminalRenderGridFrame.self, from: data) else {
             return nil
         }
-        let frame: MobileTerminalRenderGridFrame
+        var frame: MobileTerminalRenderGridFrame
         if full, changedRows == nil {
             frame = fullFrame
         } else {
@@ -7367,7 +7367,36 @@ final class TerminalSurface: Identifiable, ObservableObject {
             }
             frame = filtered
         }
+        // Stamp the authoritative viewport position from this real surface's
+        // scrollbar so the mobile mirror (which has no local scrollback) can show
+        // a jump-to-bottom affordance only when the user has scrolled up. The
+        // alternate screen has no scrollback (`total == len`), so a TUI is always
+        // reported at the bottom and the affordance stays hidden. A `nil`
+        // scrollbar (no SCROLLBAR action seen yet) is treated as at-bottom by the
+        // client. Covers full AND delta frames, so the signal tracks during a drag.
+        frame.atBottom = mobileViewportAtBottom()
         return (frame, frame.plainRows())
+    }
+
+    /// Whether this surface's viewport is pinned to the live bottom of the
+    /// terminal, derived from libghostty's last `GHOSTTY_ACTION_SCROLLBAR`
+    /// report (`offset + len >= total`). The mobile mirror has no local
+    /// scrollback, so this Mac-side value is the authoritative "scrolled up vs
+    /// at bottom" signal it rides on every render-grid frame. Returns `true`
+    /// when no scrollbar has been reported yet (no scrollback to be away from).
+    @MainActor
+    func mobileViewportAtBottom() -> Bool {
+        guard let scrollbar = surfaceView.scrollbar else { return true }
+        return scrollbar.offset + scrollbar.len >= scrollbar.total
+    }
+
+    /// Jump this real surface's viewport to the live bottom (out of scrollback),
+    /// mirroring the desktop `scroll_to_bottom` binding. The mobile mirror cannot
+    /// do this locally (it has no scrollback of its own), so the phone routes its
+    /// jump-to-latest tap through here.
+    @MainActor
+    func mobileScrollToBottom() {
+        _ = performBindingAction("scroll_to_bottom")
     }
 
     /// Send text with control characters (Return, Tab, etc.) delivered as key

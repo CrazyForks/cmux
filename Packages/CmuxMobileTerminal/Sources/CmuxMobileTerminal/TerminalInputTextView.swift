@@ -8,10 +8,11 @@ import UIKit
 ///
 /// This is a **documentless responder**, not a text editor. It conforms to
 /// ``UIKeyInput`` and ``UITextInput`` directly on a bare `UIView` (the same
-/// construction iSH's `TerminalView` ships) instead of subclassing
-/// `UITextView`. Every committed character is forwarded to the remote Mac and
-/// nothing is echoed locally, so there is no editable buffer to keep in sync —
-/// the view owns only a transient IME ``markedText`` string.
+/// construction iSH's `TerminalView` and vvterm's IME proxy ship) instead of
+/// subclassing `UITextView`. Every committed character is forwarded to the
+/// remote Mac and nothing is echoed locally, so there is no editable buffer to
+/// keep in sync — the view owns only a transient IME ``markedText`` string plus
+/// a zero-width *delete-repeat anchor* (see ``usesDeleteRepeatAnchor``).
 ///
 /// ## Why not a `UITextView`
 ///
@@ -29,10 +30,12 @@ import UIKit
 ///   `text = ""` clear nuked the placeholder mid-flight.
 ///
 /// A bare ``UIKeyInput``/``UITextInput`` responder with no document has neither
-/// problem. The framework honors ``hasText`` for repeat on a raw responder, and
-/// the explicit dictation-placeholder methods on a real (non-cleared)
-/// `UITextInput` conformer let recognized text arrive through ``insertText(_:)``
-/// as one multi-character block, which routes to the bracketed-paste sink.
+/// problem. The framework honors ``hasText`` for repeat on a raw responder, the
+/// view presents vvterm's toggling one-character zero-width document so UIKit's
+/// modern document-driven repeat path also keeps firing, and the explicit
+/// dictation-placeholder methods on a real (non-cleared) `UITextInput` conformer
+/// let recognized text arrive through ``insertText(_:)`` as one block, which
+/// routes to the bracketed-paste sink.
 ///
 /// Autocorrect/predictive text stay **disabled** here and fundamentally cannot
 /// be enabled: they require the field to retain the in-progress word, which is
@@ -73,11 +76,20 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     /// Invoked when the composer accessory button is tapped. The host toggles
     /// the iMessage-style composer above the terminal.
     var onToggleComposer: (() -> Void)?
+    /// Fired by the pinned HIDE button: temporarily hides the toolbar + composer
+    /// until the next terminal tap (item 2).
+    var onHideChrome: (() -> Void)?
+    /// Fired by the attachments button: the host presents the iOS photo/file picker
+    /// and routes a picked image through the existing image-attach path (item 5).
+    var onOpenAttachments: (() -> Void)?
     var accessoryLayoutInsetsProvider: (() -> UIEdgeInsets)?
     /// The leftmost toolbar button. Toggles its glyph between dismiss-keyboard
     /// (when the keyboard is up) and show-keyboard (when down) via
     /// ``setKeyboardShown(_:)``.
     private weak var dismissButton: UIButton?
+    /// The composer toggle, pinned in the container (not the scrollable stack) so
+    /// it is always reachable regardless of the button row's scroll position.
+    private weak var composerButton: UIButton?
     /// The armed/sticky modifier state machine, extracted into the testable
     /// ``TerminalInputModifierState`` reducer. This view is now a dumb
     /// first-responder that forwards taps into the reducer and reads its state
@@ -94,35 +106,36 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
 
     /// The in-progress IME composition string, or `nil` when not composing.
     ///
-    /// This is the view's *only* text state. While an IME (CJK, emoji-via-IME)
-    /// is composing, UIKit calls ``setMarkedText(_:selectedRange:)`` with the
-    /// candidate; the view holds it here so ``markedTextRange`` reports active
-    /// composition and ``text(in:)`` can answer the framework's read-back. On
-    /// ``unmarkText()`` the held string commits through ``insertText(_:)`` and
-    /// this clears. There is no committed-document buffer.
+    /// This is the view's only *committed* text state. While an IME (CJK,
+    /// emoji-via-IME) is composing, UIKit calls
+    /// ``setMarkedText(_:selectedRange:)`` with the candidate; the view holds it
+    /// here so ``markedTextRange`` reports active composition and ``text(in:)``
+    /// can answer the framework's read-back. On ``unmarkText()`` the held string
+    /// commits through ``insertText(_:)`` and this clears. There is no
+    /// committed-document buffer.
     private var markedText: String?
+
+    /// Toggles the zero-width character used for the delete-repeat anchor on each
+    /// empty-buffer ``deleteBackward()``. Alternating between two distinct
+    /// zero-width characters guarantees the virtual document's *contents* change
+    /// every delete, which (alongside the `inputDelegate` text-change brackets)
+    /// re-arms UIKit's document-driven backspace repeat. Borrowed verbatim from
+    /// vvterm's `deleteRepeatAnchorUsesAlternate`.
+    private var deleteRepeatAnchorUsesAlternate = false
 
     /// Monotonic-ish tap timestamp for the reducer's double-tap window. Uses
     /// the same wall-clock source the legacy `Date()` comparisons used, so the
     /// 0.4s sticky promotion behaves identically.
     private static func tapNow() -> TimeInterval { Date().timeIntervalSinceReferenceDate }
 
-    /// Long-lived sentinel identifying the IME marked-text region. Returned from
-    /// ``markedTextRange`` only while ``markedText`` is non-nil; UIKit compares
-    /// it by object identity.
-    private let markedTextRangeSentinel = TerminalInputTextRange()
-    /// Long-lived sentinel identifying the (always empty) selection. Returned
-    /// from ``selectedTextRange``; its presence is what stops the "speak
-    /// selection" action from crashing while looking for a selection.
-    private let selectedTextRangeSentinel = TerminalInputTextRange()
-
     /// The framework-supplied delegate that wants to know about marked/selection
-    /// changes. Required stored property of the ``UITextInput`` conformance; the
-    /// view notifies it around ``setMarkedText(_:selectedRange:)`` so the IME
-    /// candidate UI stays in sync.
+    /// changes. Required by the ``UITextInput`` conformance; the view notifies it
+    /// around ``setMarkedText(_:selectedRange:)`` and around each empty-buffer
+    /// delete (the anchor re-arm) so the keyboard's composition and repeat
+    /// machinery stay synchronized.
     weak var inputDelegate: (any UITextInputDelegate)?
 
-    /// Word/sentence tokenizer required by ``UITextInput``. The view has no
+    /// Word/sentence tokenizer required by ``UITextInput``. The view has no real
     /// document to tokenize, but the protocol mandates a non-nil tokenizer; the
     /// default string tokenizer satisfies it without ever being meaningfully
     /// queried.
@@ -164,22 +177,6 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
         set {}
     }
 
-    /// Always report that there is text to delete.
-    ///
-    /// This is the load-bearing piece (borrowed from iSH's `TerminalView`) that
-    /// makes the system software keyboard's *hold-to-repeat* backspace work. On
-    /// a bare ``UIKeyInput`` responder (this view) the keyboard's auto-repeat
-    /// timer keeps firing ``deleteBackward()`` only while the first responder
-    /// reports `hasText == true`; the moment it reads `false` the repeat stops.
-    /// It is always safe to send a DEL byte to the remote terminal, so there is
-    /// no "nothing to delete" state to honor — return `true` unconditionally and
-    /// let the keyboard repeat indefinitely.
-    ///
-    /// Internal byte-routing therefore must *not* key off `hasText` (it is a
-    /// constant); ``deleteBackward()`` and the modifier guards key off
-    /// ``markedText`` (IME composition) instead.
-    var hasText: Bool { true }
-
     override var keyCommands: [UIKeyCommand]? {
         guard markedText == nil else { return nil }
         var commands = TerminalHardwareKeyResolver.makeKeyCommands(
@@ -213,6 +210,71 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
         handlePasteAction()
     }
 
+    // MARK: Hold-to-repeat backspace (hasText + zero-width anchor)
+
+    /// Always report that there is text to delete.
+    ///
+    /// This is the legacy ``UIKeyInput`` gate (borrowed from iSH's
+    /// `TerminalView`) for the software keyboard's *hold-to-repeat* backspace. On
+    /// a bare ``UIKeyInput`` responder (this view) the keyboard's auto-repeat
+    /// timer keeps firing ``deleteBackward()`` only while the first responder
+    /// reports `hasText == true`. It is always safe to send a DEL byte to the
+    /// remote terminal, so there is no "nothing to delete" state to honor —
+    /// return `true` unconditionally.
+    ///
+    /// Internal byte-routing therefore must *not* key off `hasText` (it is a
+    /// constant); ``deleteBackward()`` and the modifier guards key off
+    /// ``markedText`` (IME composition) instead.
+    var hasText: Bool { true }
+
+    /// Whether the view is currently presenting the zero-width delete-repeat
+    /// anchor: there is no IME composition, so the view fabricates a
+    /// one-character virtual document with the caret at the end. While this is
+    /// true UIKit's modern document-driven repeat path sees a deletable character
+    /// to the left of the cursor and keeps firing ``deleteBackward()``. Mirrors
+    /// vvterm's `usesDeleteRepeatAnchor`.
+    private var usesDeleteRepeatAnchor: Bool { markedText == nil }
+
+    /// The current zero-width anchor character. Toggling between two distinct
+    /// zero-width characters on each empty-buffer delete forces the virtual
+    /// document's contents to change, which is what re-arms the repeat. (vvterm:
+    /// `deleteRepeatAnchorText`.)
+    private var deleteRepeatAnchorText: String {
+        deleteRepeatAnchorUsesAlternate ? "\u{2060}" : "\u{200B}"
+    }
+
+    /// The virtual document UIKit walks: the IME composition while marking,
+    /// otherwise the one-character zero-width delete-repeat anchor.
+    private var textInputDocument: String {
+        usesDeleteRepeatAnchor ? deleteRepeatAnchorText : (markedText ?? "")
+    }
+
+    private var textInputDocumentLength: Int {
+        (textInputDocument as NSString).length
+    }
+
+    /// The caret sits at the end of the virtual document (after the anchor char,
+    /// or at the end of the marked composition) so there is always something to
+    /// its left to delete.
+    private var effectiveSelectedRange: NSRange {
+        NSRange(location: textInputDocumentLength, length: 0)
+    }
+
+    /// Re-arm the delete-repeat anchor after an empty-buffer delete.
+    ///
+    /// Toggling the anchor char inside `textWillChange`/`textDidChange` brackets
+    /// tells UIKit the (still one-character) virtual document changed, so the
+    /// keyboard's document-driven repeat timer re-reads it and fires the next
+    /// ``deleteBackward()``. Without this the modern repeat path stalls after one
+    /// delete even though ``hasText`` stays `true` — this is the refinement the
+    /// prior documentless attempt lacked. Mirrors vvterm's
+    /// `notifyVirtualDeleteAnchorDidChange`.
+    private func notifyVirtualDeleteAnchorDidChange() {
+        inputDelegate?.textWillChange(self)
+        deleteRepeatAnchorUsesAlternate.toggle()
+        inputDelegate?.textDidChange(self)
+    }
+
     private static let monokaiBarColor = UIColor(red: 0x27/255.0, green: 0x28/255.0, blue: 0x22/255.0, alpha: 1)
     private static let accessoryHorizontalInset: CGFloat = 16
     private static let accessoryButtonFont = UIFont.systemFont(ofSize: 14, weight: .medium)
@@ -227,11 +289,19 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     /// magnifying-glass/clipboard glyphs, so at the shared 13pt it still loomed
     /// larger than its neighbors; 11pt brings it visually in line with them.
     private static let composerButtonSymbolConfig = UIImage.SymbolConfiguration(pointSize: 11, weight: .medium)
-    /// One comfortable horizontal inset applied to every button so the bar reads
-    /// tappable and uniform. Each button then hugs its label/icon plus this inset.
-    private static let accessoryButtonContentInsets = NSDirectionalEdgeInsets(top: 5, leading: 8, bottom: 5, trailing: 8)
+    /// One comfortable inset applied to every button so the bar reads tappable and
+    /// uniform. Each button hugs its label/icon plus this inset. Round 8 moves the bar's
+    /// vertical breathing room from the scroll-view MARGIN (the old `+2/-4` stack insets
+    /// that shrank the capsule inside the strip) into this PADDING, so the glass capsule
+    /// grows to fill the full strip height (taller, not wider — item 4) while the
+    /// reserved strip height is unchanged. The horizontal inset is trimmed so the
+    /// capsule hugs its glyph tighter (item 5).
+    private static let accessoryButtonContentInsets = NSDirectionalEdgeInsets(top: 6, leading: 6, bottom: 6, trailing: 6)
     private static let accessoryButtonCornerRadius: CGFloat = 6
-    private static let accessoryButtonHeight: CGFloat = 28
+    /// Button height. Equal to ``dockedNubSize`` so the capsule fills the strip
+    /// vertically (item 4): the buttons are as tall as the section, with the breathing
+    /// room now living BELOW the strip (``dockedBottomPadding``) instead of inside it.
+    private static let accessoryButtonHeight: CGFloat = dockedNubSize
     /// Size of the directional arrow nub (the tallest control in the bar). The
     /// button-row strip is sized to exactly this so the nub fills the strip with no
     /// slack above it, and the host reserves exactly this much grid height. Round 5
@@ -262,11 +332,13 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     static let dockedButtonRowHeight: CGFloat = dockedNubSize + dockedBottomPadding
     /// Minimum (not fixed) button width. Text buttons (Tab, Esc, ^C, ^D) size to
     /// their intrinsic content width and only floor here so they hug their label
-    /// plus the comfortable inset; single-glyph modifiers/icons take a fixed width
-    /// so they stay uniform. Sized for a comfortable tap target; the 28pt height
-    /// supplies vertical area and this floor keeps short keys from reading as
-    /// cramped.
-    private static let accessoryButtonMinWidth: CGFloat = 38
+    /// plus the comfortable inset; single-glyph modifiers/icons (⌃ ⌥ ⌘, the arrow
+    /// keys, paste, attachments) take this as a FIXED width so they stay uniform.
+    /// Round 8 drops it from 38 to 32 so the glyph keys hug their icon tighter — the
+    /// arrow keys now sit roughly as wide as ⌃/⌥/⌘ and paste matches the other icons
+    /// (item 5); the taller capsule (item 4) supplies the tap area that the wider
+    /// button used to.
+    private static let accessoryButtonMinWidth: CGFloat = 32
     private static let accessoryButtonNormalBackground = UIColor(white: 0.35, alpha: 1)
     private var accessoryBackgroundLeadingConstraint: NSLayoutConstraint?
     private var accessoryBackgroundTrailingConstraint: NSLayoutConstraint?
@@ -304,7 +376,8 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
 
         let stack = UIStackView()
         stack.axis = .horizontal
-        stack.spacing = 6
+        // Tighter inter-button spacing so the keys read as a compact row (item 5).
+        stack.spacing = 4
         stack.alignment = .center
 
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -319,9 +392,24 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
         }
         nub.translatesAutoresizingMaskIntoConstraints = false
 
+        // The composer toggle is pinned directly in the container (like the
+        // keyboard-dismiss button and the arrow nub), OUTSIDE the horizontally
+        // scrollable button row. It used to be the leading item of the scrollable
+        // stack, but any scroll (e.g. reaching the HIDE/customize controls at the
+        // right edge of the strip) carried it off-screen left, and that offset
+        // survived a hide→reveal reflow, stranding the compose button at a large
+        // negative window X (~-840 in a 402pt window) where it was unhittable.
+        // Pinning it makes "the composer is always one tap away" a structural
+        // invariant immune to `contentOffset`, which is what the populate comment
+        // below already claimed. It is not config/remote dependent, so it is built
+        // once here (not rebuilt by `populateAccessoryActions`).
+        let composerButton = makeAccessoryButton(for: .composer)
+        self.composerButton = composerButton
+
         container.addSubview(backgroundView)
         container.addSubview(dismissButton)
         container.addSubview(nub)
+        container.addSubview(composerButton)
         container.addSubview(scrollView)
 
         let backgroundLeadingConstraint = backgroundView.leadingAnchor.constraint(equalTo: container.leadingAnchor)
@@ -383,18 +471,30 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             nub.widthAnchor.constraint(equalToConstant: Self.dockedNubSize),
             nub.heightAnchor.constraint(equalToConstant: Self.dockedNubSize),
 
-            scrollView.leadingAnchor.constraint(equalTo: nub.trailingAnchor, constant: 6),
+            // Pinned composer toggle: directly after the nub (same 6pt gap the
+            // scroll view used to take), centered on the shared strip line. The
+            // scroll view starts after it with the 4pt inter-button spacing the
+            // stack used between the composer and attachments, so the bar reads
+            // identically to before — only now the composer can never scroll away.
+            composerButton.leadingAnchor.constraint(equalTo: nub.trailingAnchor, constant: 6),
+            composerButton.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
+
+            scrollView.leadingAnchor.constraint(equalTo: composerButton.trailingAnchor, constant: 4),
             scrollTrailingConstraint,
             scrollView.topAnchor.constraint(equalTo: buttonRow.topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: buttonRow.bottomAnchor),
 
-            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 2),
-            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -2),
+            // No vertical margin inside the scroll view: the stack fills the strip
+            // height so the glass capsules grow to the full section height (item 4).
+            // The bar's breathing room lives BELOW the strip (`dockedBottomPadding`),
+            // not as a margin that shrinks the buttons.
+            stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
             stack.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
             // Zero trailing content padding so the last button runs to the screen
             // edge when scrolled to the end (the bar scrolls horizontally).
             stack.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
-            stack.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor, constant: -4),
+            stack.heightAnchor.constraint(equalTo: scrollView.frameLayoutGuide.heightAnchor),
         ])
 
         accessoryBackgroundLeadingConstraint = backgroundLeadingConstraint
@@ -421,6 +521,34 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     private weak var accessoryStackView: UIStackView?
     private var isMacRemote = false
 
+    #if DEBUG
+    /// Regression sentinel for the hide→reveal "compose button off-screen left" jank.
+    /// The composer toggle is now pinned in the container (not the scrollable stack),
+    /// so its window X (``composeWinX``) must stay on-screen REGARDLESS of how far the
+    /// button row is scrolled (``scrollOffsetX`` can be anything up to
+    /// `scrollContentW - scrollFrameW`). Before the fix the composer rode inside the
+    /// scroll view and a persisted right-scroll carried it to ~-840. Appended to
+    /// ``GhosttySurfaceView.composerDockProbeValue`` so it lands in the XCUITest
+    /// failure message with no log plumbing.
+    var accessoryLayoutDiagnostics: String {
+        let scroll = accessoryStackView?.superview as? UIScrollView
+        let win = window
+        let scrollOffsetX = scroll.map { Int($0.contentOffset.x) } ?? -1
+        let scrollContentW = scroll.map { Int($0.contentSize.width) } ?? -1
+        let scrollFrameW = scroll.map { Int($0.frame.width) } ?? -1
+        let composeWinX: Int = {
+            guard let compose = composerButton, let win else { return -9999 }
+            return Int(compose.convert(compose.bounds, to: win).minX)
+        }()
+        return [
+            "scrollOffsetX=\(scrollOffsetX)",
+            "scrollContentW=\(scrollContentW)",
+            "scrollFrameW=\(scrollFrameW)",
+            "composeWinX=\(composeWinX)",
+        ].joined(separator: ";")
+    }
+    #endif
+
     func updateAccessoryLayoutInsets() {
         let insets = accessoryLayoutInsetsProvider?() ?? .zero
         let leftInset = max(0, insets.left)
@@ -440,11 +568,13 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
         }
     }
 
-    /// Build (or rebuild) the bar's buttons: a pinned leading composer toggle,
+    /// Build (or rebuild) the SCROLLABLE button row: a leading attachments button,
     /// then the user's configured order (modifiers, zoom, paste, shortcuts, and
     /// custom actions all reorderable together), followed by the fixed trailing
-    /// "customize" control. The ⌘ item is rendered only when driving a Mac remote.
-    /// Safe to call repeatedly; it clears the stack first.
+    /// "customize" control. The composer toggle is NOT here — it is pinned in the
+    /// container outside the scroll view (see ``terminalAccessoryToolbar``). The ⌘
+    /// item is rendered only when driving a Mac remote. Safe to call repeatedly; it
+    /// clears the stack first.
     private func populateAccessoryActions() {
         guard let stack = accessoryStackView else { return }
         for view in stack.arrangedSubviews {
@@ -452,10 +582,17 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             view.removeFromSuperview()
         }
 
-        // The composer toggle is not a user-configurable shortcut; it stays
-        // pinned at the bar's leading edge so the iMessage-style composer is
-        // always one tap away regardless of the reorderable region below.
-        stack.addArrangedSubview(makeAccessoryButton(for: .composer))
+        // The composer toggle is NOT added here: it is pinned directly in the
+        // container (see ``terminalAccessoryToolbar``), OUTSIDE this scrollable
+        // stack, so it can never be carried off-screen by the button row's scroll
+        // position. It is built once at toolbar construction (not config/remote
+        // dependent), so a repopulate must not re-add or rebuild it.
+        //
+        // The attachments button, the bar's first scrollable item: opens the iOS
+        // photo/file picker and routes a picked image through the existing image-attach
+        // path (item 5). Not a configurable shortcut, so it is pinned at the leading
+        // edge of the reorderable region rather than listed inside it.
+        stack.addArrangedSubview(makeAttachmentsButton())
 
         // The user-configurable region: built-in shortcuts/modifiers/zoom/paste
         // and custom actions, all in the user's saved order.
@@ -471,6 +608,9 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
                 stack.addArrangedSubview(makeCustomAccessoryButton(for: custom))
             }
         }
+        // The HIDE button, pinned just before "customize": temporarily hides the
+        // whole bottom chrome (toolbar + composer) until the next terminal tap (item 2).
+        stack.addArrangedSubview(makeHideChromeButton())
         // The "customize" button pinned at the very end of the bar.
         stack.addArrangedSubview(makeToolbarSettingsButton())
 
@@ -629,11 +769,12 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             "input.deleteBackward identity=\(deleteIdentity) class=\(Self.responderClassName(deleteResponder)) onSelf=\(deleteResponder === self) composing=\(markedText != nil)"
         )
         #endif
+        TerminalInputDebugLog.log("proxy.deleteBackward composing=\(markedText != nil) ctrl=\(controlAccessoryArmed) alt=\(alternateAccessoryArmed) cmd=\(commandAccessoryArmed)")
         // Routing keys off `markedText` (IME composition in progress), NOT
         // `hasText`: `hasText` is a forced constant `true` so the software
         // keyboard auto-repeats backspace, so it can no longer mean "the local
-        // document is empty". While composing, the delete edits the marked text
-        // locally; otherwise it is a real backspace that must reach the Mac.
+        // document is empty". While composing, the delete cancels the
+        // composition; otherwise it is a real backspace that must reach the Mac.
         if commandAccessoryArmed, markedText == nil {
             if !commandAccessorySticky {
                 setCommandAccessoryArmed(false)
@@ -678,6 +819,10 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             setMarkedText(nil, selectedRange: NSRange(location: 0, length: 0))
             return
         }
+        // Empty buffer: this is a real backspace. Send DEL to the Mac and re-arm
+        // the zero-width delete-repeat anchor so UIKit's document-driven repeat
+        // keeps firing while the key is held.
+        notifyVirtualDeleteAnchorDidChange()
         onBackspace?()
     }
 
@@ -697,15 +842,18 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
 
     /// Test seam standing in for an IME/dictation/commit cycle.
     ///
-    /// Drives the same path the keyboard would: composing text marks, then a
+    /// Drives the same path the keyboard would: composing text marks it (so
+    /// ``markedText`` is held and the anchor is suppressed), while a
     /// non-composing change commits it. Mirrors the real
     /// ``setMarkedText(_:selectedRange:)`` → ``insertText(_:)`` flow so tests can
-    /// assert routing (single char vs. paste block) without a live keyboard.
+    /// assert routing without a live keyboard.
     func simulateTextChangeForTesting(_ text: String, isComposing: Bool) {
         if isComposing {
             setMarkedText(text, selectedRange: NSRange(location: text.count, length: 0))
         } else {
-            markedText = nil
+            if markedText != nil {
+                withMarkedTextChange { markedText = nil }
+            }
             guard !text.isEmpty else { return }
             emitCommittedText(text, source: "textChange")
         }
@@ -767,6 +915,16 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
         onOpenToolbarSettings?()
     }
 
+    @objc
+    private func handleHideChrome() {
+        onHideChrome?()
+    }
+
+    @objc
+    private func handleOpenAttachments() {
+        onOpenAttachments?()
+    }
+
     /// Fire a custom action's bytes. Custom actions are macros, so any armed
     /// modifier is cleared first to avoid silently modifying the macro's output.
     private func handleCustomAction(_ custom: CustomToolbarAction) {
@@ -826,6 +984,56 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             // Text custom actions (e.g. "Claude") grow with their title.
             button.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.accessoryButtonMinWidth).isActive = true
         }
+        return button
+    }
+
+    /// The attachments button. A plain `UIButton` (not an ``AccessoryActionButton``)
+    /// so the armed-modifier styling/relabel loops skip it. Styled as a glass glyph key
+    /// to match the other icon buttons; tapping it asks the host to present the iOS
+    /// photo/file picker, which routes a picked image through the existing image-attach
+    /// path (item 5). Min-width matches the glyph keys so it stays uniform.
+    private func makeAttachmentsButton() -> UIButton {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.addTarget(self, action: #selector(handleOpenAttachments), for: .touchUpInside)
+        button.accessibilityIdentifier = "terminal.inputAccessory.attachments"
+        button.accessibilityLabel = String(
+            localized: "terminal.input_accessory.attachments",
+            defaultValue: "Add Attachment"
+        )
+        var config = Self.accessoryButtonConfiguration(armed: false, sticky: false)
+        config.image = UIImage(systemName: "paperclip")
+        config.preferredSymbolConfigurationForImage = Self.accessoryButtonSymbolConfig
+        config.contentInsets = Self.accessoryButtonContentInsets
+        button.configuration = config
+        button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
+        button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
+        return button
+    }
+
+    /// The HIDE button. A plain `UIButton` (not an ``AccessoryActionButton``) so the
+    /// armed-modifier styling/relabel loops skip it. Styled as a de-emphasized control
+    /// like "customize"; tapping it temporarily hides the whole bottom chrome (toolbar
+    /// + composer) until the next terminal tap (item 2). Min-width matches the glyph
+    /// keys so it stays uniform.
+    private func makeHideChromeButton() -> UIButton {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.addTarget(self, action: #selector(handleHideChrome), for: .touchUpInside)
+        button.accessibilityIdentifier = "terminal.inputAccessory.hideChrome"
+        button.accessibilityLabel = String(
+            localized: "terminal.input_accessory.hideChrome",
+            defaultValue: "Hide Toolbar"
+        )
+        var config = UIButton.Configuration.plain()
+        config.image = UIImage(systemName: "chevron.down.square")
+        config.preferredSymbolConfigurationForImage = Self.accessoryButtonSymbolConfig
+        config.baseForegroundColor = UIColor(white: 0.7, alpha: 1)
+        config.contentInsets = Self.accessoryButtonContentInsets
+        button.configuration = config
+        button.tintColor = UIColor(white: 0.7, alpha: 1)
+        button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
+        button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
         return button
     }
 
@@ -1344,10 +1552,10 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
 
 extension TerminalInputTextView {
     // Autocorrect/predictive/smart substitutions are all off: the view forwards
-    // each keystroke to the remote terminal and keeps no in-progress word for
-    // the keyboard to correct against. Returning these as computed properties
-    // (rather than the `UITextView` stored traits the old design used) keeps the
-    // keyboard from offering corrections it could never apply.
+    // each keystroke to the remote terminal and keeps no in-progress word for the
+    // keyboard to correct against. Returning these as computed properties (rather
+    // than the `UITextView` stored traits the old design used) keeps the keyboard
+    // from offering corrections it could never apply.
     var autocorrectionType: UITextAutocorrectionType { get { .no } set {} }
     var autocapitalizationType: UITextAutocapitalizationType { get { .none } set {} }
     var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
@@ -1358,20 +1566,31 @@ extension TerminalInputTextView {
     var returnKeyType: UIReturnKeyType { get { .default } set {} }
 }
 
-// MARK: - UITextInput (documentless conformance)
+// MARK: - UITextInput (documentless conformance + delete-repeat anchor)
 
 // This view owns no editable document. It implements `UITextInput` to unlock two
-// keyboard features that a bare `UIKeyInput` view does not get — system
-// dictation (the mic key) and IME marked-text composition — exactly the way
-// iSH's `TerminalView` does. Recognized dictation text and committed IME
-// candidates both arrive through ``insertText(_:)`` and route to the terminal;
-// the geometry/offset methods return neutral values because there is nothing to
-// measure. UIKit compares the marked/selected ranges by object identity.
+// keyboard features a bare `UIKeyInput` view does not get — system dictation (the
+// mic key) and IME marked-text composition — and to present vvterm's toggling
+// one-character zero-width *delete-repeat anchor* so the software keyboard's
+// modern document-driven backspace auto-repeat keeps firing while the key is
+// held. Recognized dictation text and committed IME candidates both arrive
+// through ``insertText(_:)`` and route to the terminal. UIKit walks the virtual
+// document (`textInputDocument`) through the offset-bearing
+// ``TerminalInputTextPosition`` / ``TerminalInputTextRange`` types, so positions
+// and ranges carry real UTF-16 offsets rather than acting as pure identity
+// sentinels — that is what lets the view report a one-character document with the
+// caret at the end, the condition the repeat path checks.
 extension TerminalInputTextView {
-    var markedTextRange: UITextRange? { markedText != nil ? markedTextRangeSentinel : nil }
+    var markedTextRange: UITextRange? {
+        guard let markedText, !markedText.isEmpty else { return nil }
+        return TerminalInputTextRange(start: 0, end: (markedText as NSString).length)
+    }
 
     var selectedTextRange: UITextRange? {
-        get { selectedTextRangeSentinel }
+        get {
+            let range = effectiveSelectedRange
+            return TerminalInputTextRange(start: range.location, end: range.location + range.length)
+        }
         set {}
     }
 
@@ -1380,13 +1599,13 @@ extension TerminalInputTextView {
         set {}
     }
 
-    var beginningOfDocument: UITextPosition { TerminalInputTextPosition() }
-    var endOfDocument: UITextPosition { TerminalInputTextPosition() }
+    var beginningOfDocument: UITextPosition { TerminalInputTextPosition(offset: 0) }
+    var endOfDocument: UITextPosition { TerminalInputTextPosition(offset: textInputDocumentLength) }
 
     /// The IME hands a candidate string in; hold it as the marked composition so
-    /// ``markedTextRange`` reports active composition. Nothing is sent to the
-    /// terminal until the candidate commits via ``insertText(_:)`` (driven by
-    /// the keyboard) or ``unmarkText()``.
+    /// ``markedTextRange`` reports active composition (which also suppresses the
+    /// delete-repeat anchor). Nothing is sent to the terminal until the candidate
+    /// commits via ``insertText(_:)`` or ``unmarkText()``.
     ///
     /// Mutating ``markedText`` changes the string the view exposes through
     /// ``text(in:)``/``markedTextRange``, so it is a *text* change in the
@@ -1394,20 +1613,21 @@ extension TerminalInputTextView {
     /// `textWillChange`/`textDidChange` (via ``withMarkedTextChange(_:)``) so the
     /// IME and dictation machinery keep their composition state synchronized.
     func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
-        TerminalInputDebugLog.log("proxy.setMarkedText text=\(TerminalInputDebugLog.textSummary(markedText ?? "")) ")
+        TerminalInputDebugLog.log("proxy.setMarkedText text=\(TerminalInputDebugLog.textSummary(markedText ?? ""))")
         withMarkedTextChange {
             self.markedText = (markedText?.isEmpty == true) ? nil : markedText
         }
     }
 
-    /// Brackets a mutation of ``markedText`` with the `UITextInputDelegate`
-    /// text-change callbacks.
+    /// Brackets a mutation of ``markedText`` (or the anchor crossover when
+    /// composition ends) with the `UITextInputDelegate` text-change callbacks.
     ///
-    /// The marked composition is the only text this view exposes, so any change
-    /// to it (set by the IME, committed by ``insertText(_:)``/``unmarkText()``,
-    /// or canceled by ``replace(_:withText:)``) is a text change UIKit must be
-    /// told about with `textWillChange`/`textDidChange`. Selection-only callbacks
-    /// would leave the keyboard observing stale composition state.
+    /// The marked composition is the only committed text this view exposes, so
+    /// any change to it — set by the IME, committed by
+    /// ``insertText(_:)``/``unmarkText()``, or canceled by ``deleteBackward()`` —
+    /// is a text change UIKit must be told about with
+    /// `textWillChange`/`textDidChange`. Selection-only callbacks would leave the
+    /// keyboard observing stale composition state.
     private func withMarkedTextChange(_ mutate: () -> Void) {
         inputDelegate?.textWillChange(self)
         mutate()
@@ -1415,7 +1635,7 @@ extension TerminalInputTextView {
     }
 
     /// Commit the in-progress IME composition. Forwards the held candidate to the
-    /// terminal as one block (multi-character commits route to bracketed paste).
+    /// terminal as one block.
     func unmarkText() {
         guard let composing = markedText else { return }
         withMarkedTextChange { markedText = nil }
@@ -1423,35 +1643,65 @@ extension TerminalInputTextView {
     }
 
     func text(in range: UITextRange) -> String? {
-        if range === markedTextRangeSentinel { return markedText }
-        if range === selectedTextRangeSentinel { return "" }
-        return nil
+        guard let range = range as? TerminalInputTextRange else { return nil }
+        let document = textInputDocument as NSString
+        let clamped = clampedDocumentRange(range.nsRange, length: document.length)
+        guard clamped.length > 0 else { return "" }
+        return document.substring(with: clamped)
     }
 
     /// Commit text delivered through a range replacement.
     ///
-    /// Most committed input arrives via ``insertText(_:)``, but some system
-    /// paths (text replacement, certain dictation/suggestion commits) deliver it
-    /// by replacing ``selectedTextRange`` or ``markedTextRange`` instead. The
-    /// view holds no addressable document, so the range itself is ignored, but
-    /// the *text* must still reach the terminal — route it through the same
-    /// commit path as ``insertText(_:)`` rather than dropping it. A replacement
-    /// of the marked region also supersedes the in-progress IME composition, so
-    /// clear it first. An empty replacement is a pure deletion of the marked
-    /// composition (no committed text to send).
+    /// Most committed input arrives via ``insertText(_:)``, but some system paths
+    /// (text replacement, certain dictation/suggestion commits) deliver it by
+    /// replacing ``selectedTextRange`` or ``markedTextRange`` instead. The view
+    /// holds no addressable document, so the range itself is ignored, but the
+    /// *text* must still reach the terminal — route it through the same commit
+    /// path as ``insertText(_:)``. A replacement of the marked region supersedes
+    /// the in-progress IME composition, so clear it first. An empty replacement is
+    /// a pure deletion of the marked composition (no committed text to send).
     func replace(_ range: UITextRange, withText text: String) {
-        TerminalInputDebugLog.log("proxy.replace text=\(TerminalInputDebugLog.textSummary(text)) marked=\(range === markedTextRangeSentinel)")
-        if range === markedTextRangeSentinel, markedText != nil {
+        TerminalInputDebugLog.log("proxy.replace text=\(TerminalInputDebugLog.textSummary(text))")
+        if markedText != nil {
             withMarkedTextChange { markedText = nil }
         }
         guard !text.isEmpty else { return }
         emitCommittedText(text, source: "replace")
     }
-    func textRange(from fromPosition: UITextPosition, to toPosition: UITextPosition) -> UITextRange? { nil }
-    func position(from position: UITextPosition, offset: Int) -> UITextPosition? { nil }
-    func position(from position: UITextPosition, in direction: UITextLayoutDirection, offset: Int) -> UITextPosition? { nil }
-    func compare(_ position: UITextPosition, to other: UITextPosition) -> ComparisonResult { .orderedSame }
-    func offset(from: UITextPosition, to toPosition: UITextPosition) -> Int { 0 }
+
+    func textRange(from fromPosition: UITextPosition, to toPosition: UITextPosition) -> UITextRange? {
+        guard let from = fromPosition as? TerminalInputTextPosition,
+              let to = toPosition as? TerminalInputTextPosition else { return nil }
+        return TerminalInputTextRange(start: from.offset, end: to.offset)
+    }
+
+    func position(from position: UITextPosition, offset: Int) -> UITextPosition? {
+        guard let position = position as? TerminalInputTextPosition else { return nil }
+        let target = min(max(position.offset + offset, 0), textInputDocumentLength)
+        return TerminalInputTextPosition(offset: target)
+    }
+
+    func position(from position: UITextPosition, in direction: UITextLayoutDirection, offset: Int) -> UITextPosition? {
+        guard let position = position as? TerminalInputTextPosition else { return nil }
+        let delta = (direction == .right || direction == .down) ? offset : -offset
+        let target = min(max(position.offset + delta, 0), textInputDocumentLength)
+        return TerminalInputTextPosition(offset: target)
+    }
+
+    func compare(_ position: UITextPosition, to other: UITextPosition) -> ComparisonResult {
+        guard let lhs = position as? TerminalInputTextPosition,
+              let rhs = other as? TerminalInputTextPosition else { return .orderedSame }
+        if lhs.offset < rhs.offset { return .orderedAscending }
+        if lhs.offset > rhs.offset { return .orderedDescending }
+        return .orderedSame
+    }
+
+    func offset(from: UITextPosition, to toPosition: UITextPosition) -> Int {
+        guard let from = from as? TerminalInputTextPosition,
+              let to = toPosition as? TerminalInputTextPosition else { return 0 }
+        return to.offset - from.offset
+    }
+
     func position(within range: UITextRange, farthestIn direction: UITextLayoutDirection) -> UITextPosition? { nil }
     func characterRange(byExtending position: UITextPosition, in direction: UITextLayoutDirection) -> UITextRange? { nil }
     func baseWritingDirection(for position: UITextPosition, in direction: UITextStorageDirection) -> NSWritingDirection { .leftToRight }
@@ -1463,12 +1713,18 @@ extension TerminalInputTextView {
     func closestPosition(to point: CGPoint, within range: UITextRange) -> UITextPosition? { nil }
     func characterRange(at point: CGPoint) -> UITextRange? { nil }
 
+    private func clampedDocumentRange(_ range: NSRange, length: Int) -> NSRange {
+        let location = min(max(range.location, 0), length)
+        let rangeLength = min(max(range.length, 0), max(length - location, 0))
+        return NSRange(location: location, length: rangeLength)
+    }
+
     // MARK: Dictation placeholder hooks
     //
-    // UIKit calls these when the mic is tapped. Returning a placeholder (an
-    // empty token; iSH does the same) is what tells the framework this view
-    // accepts dictation; the recognized text then arrives via `insertText`. The
-    // remove hook is a no-op because there is no document placeholder to strip.
+    // UIKit calls these when the mic is tapped. Returning a placeholder (an empty
+    // token; iSH does the same) is what tells the framework this view accepts
+    // dictation; the recognized text then arrives via `insertText`. The remove
+    // hook is a no-op because there is no document placeholder to strip.
     func insertDictationResultPlaceholder() -> Any {
         #if DEBUG
         // The ENTRY signal that the mic was tapped and UIKit accepted this view

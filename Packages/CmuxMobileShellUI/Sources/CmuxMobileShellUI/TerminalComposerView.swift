@@ -81,6 +81,14 @@ struct TerminalComposerView: View {
             // residual TextField/@FocusState render-blank case.
             recordComposerEvent(.composerFieldFocusChanged, a: focused ? 1 : 0)
         }
+        .onChange(of: store.composerFocusRequest) { _, _ in
+            // The surface asked the field to take focus without re-presenting the
+            // composer — the reveal-after-hide case, where the chrome and draft are
+            // already back but the terminal proxy holds first responder. Driving
+            // `@FocusState` here keeps it the single source of truth (the surface
+            // never touches the hosted UITextField directly).
+            focusField()
+        }
     }
 
     /// Record a composer diagnostic event into the store's structured log (DEBUG

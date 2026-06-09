@@ -3,6 +3,7 @@ import CMUXMobileCore
 import CmuxMobileDiagnostics
 import CmuxMobileShell
 import CmuxMobileTerminal
+import PhotosUI
 import SwiftUI
 import UIKit
 
@@ -36,6 +37,11 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
     /// band and pins first responder so the keyboard hands over in place; when it
     /// flips off, the field is unmounted and the band collapses to zero height.
     var isComposerActive: Bool = false
+    /// Whether the terminal is scrolled up (has room to jump to the live bottom).
+    /// Read from the store in the SwiftUI body so a change re-invokes
+    /// ``updateUIView(_:context:)``, which pushes it into the surface to toggle
+    /// the floating jump-to-bottom button.
+    var scrolledUp: Bool = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator(surfaceID: surfaceID, store: store)
@@ -66,6 +72,7 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
         view.diagnosticLog = store.diagnosticLog
         #endif
         context.coordinator.attach(surfaceView: view)
+        view.setScrolledUp(scrolledUp)
         // Mount the composer band immediately if the composer was already open when
         // this surface was (re)built (e.g. a terminal switch while composing).
         context.coordinator.setComposerMounted(isComposerActive)
@@ -81,6 +88,9 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
         // state write, so it is safe in `updateUIView`.
         guard let surfaceView = uiView as? GhosttySurfaceView else { return }
         surfaceView.autoFocusOnWindowAttach = autoFocusOnWindowAttach
+        // Toggle the floating jump-to-bottom button from the store's authoritative
+        // scrolled-up state (UIKit-internal mutation, idempotent in the surface).
+        surfaceView.setScrolledUp(scrolledUp)
         surfaceView.setComposerActive(isComposerActive)
         context.coordinator.setComposerMounted(isComposerActive)
         // A width change (rotation) is not a text change, so the field-content trigger
@@ -121,9 +131,25 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
             // clears its viewport pin on the Mac (see `terminalOutputStream`).
             outputTask = Task { @MainActor [weak surfaceView] in
                 for await data in store.terminalOutputStream(surfaceID: surfaceID) {
-                    guard !Task.isCancelled else { return }
+                    guard !Task.isCancelled else {
+                        #if DEBUG
+                        // RENDER: the consumer loop ended on an explicit cancel
+                        // (surface teardown / terminal switch). Expected — distinguishes
+                        // an intentional stop from a silent stream-finish wedge.
+                        store.diagnosticLog?.record(DiagnosticEvent(.streamEnded, a: 1))
+                        #endif
+                        return
+                    }
                     surfaceView?.processOutput(data)
                 }
+                #if DEBUG
+                // RENDER: the render-grid consumer `for await` finished on its OWN (the
+                // stream completed) rather than via cancel. If this fires while the
+                // surface is still on screen and input still works, the render-grid
+                // consumer has gone silent — the "terminal frozen, keystrokes reach
+                // macOS" wedge — and the surface will stop receiving frames.
+                store.diagnosticLog?.record(DiagnosticEvent(.streamEnded, a: 0))
+                #endif
             }
         }
 
@@ -149,8 +175,14 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
                 // live grows/shrinks animate.
                 reportComposerHeight(animated: false)
             } else {
-                surfaceView.mountComposerView(nil)
-                surfaceView.setComposerBandHeight(0, animated: true)
+                // Symmetric close (item 3): animate the band to 0 with the field STILL
+                // mounted, on the keyboard curve, then unmount it in the completion.
+                // Round 7 unmounted first and then collapsed the band, so the field
+                // vanished before the band finished shrinking (the janky close). Keep
+                // the surface reference for the deferred unmount.
+                surfaceView.setComposerBandHeight(0, animated: true) { [weak surfaceView] in
+                    surfaceView?.mountComposerView(nil)
+                }
             }
         }
 
@@ -295,6 +327,17 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
             }
         }
 
+        func ghosttySurfaceViewDidRequestScrollToBottom(_ surfaceView: GhosttySurfaceView) {
+            // The floating jump-to-bottom button was tapped. The phone's mirror has
+            // no local scrollback, so route the jump to the Mac's real surface; it
+            // scrolls out of scrollback and emits a render frame reporting at-bottom,
+            // which hides the button.
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.store?.scrollTerminalToBottom(surfaceID: self.surfaceID)
+            }
+        }
+
         func ghosttySurfaceViewDidRequestToolbarSettings(_ surfaceView: GhosttySurfaceView) {
             // The "customize" button on the keyboard toolbar. The editor view
             // lives in this UI package, so present it here (the terminal package
@@ -305,31 +348,40 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
             presenter.present(editor, animated: true)
         }
 
+        func ghosttySurfaceViewDidRequestAttachment(_ surfaceView: GhosttySurfaceView) {
+            // The attachments button on the docked accessory bar (item 5). Present the
+            // system photo picker; a picked image is routed through the EXISTING
+            // image-attach path (`submitTerminalPasteImage`) so the Mac materializes a
+            // temp file and injects its path into the terminal, exactly like a pasted
+            // image. The picker view lives in this UI package, so present it here.
+            guard let presenter = presentingController(for: surfaceView) else { return }
+            var config = PHPickerConfiguration()
+            config.filter = .images
+            config.selectionLimit = 1
+            let picker = PHPickerViewController(configuration: config)
+            picker.delegate = self
+            presenter.present(picker, animated: true)
+        }
+
         func ghosttySurfaceViewDidRequestComposerToggle(_ surfaceView: GhosttySurfaceView) {
-            // The composer button on the docked accessory bar was tapped. Flip the
-            // store flag; the terminal screen observes it and presents/dismisses
-            // the iMessage-style composer.
+            // The composer button on the docked accessory bar was tapped AND the
+            // surface resolved (from the dock state) that this is a genuine open/close
+            // toggle. Flip the store flag; the terminal screen observes it and
+            // presents/dismisses the iMessage-style composer. The reveal-and-focus
+            // case routes through `...DidRequestComposerFocus` instead, so this never
+            // closes a still-presented-but-suppressed composer.
             Task { @MainActor [weak store] in
                 store?.toggleComposer()
             }
         }
 
-        func ghosttySurfaceViewDidRequestComposerDismiss(_ surfaceView: GhosttySurfaceView) {
-            // The keyboard-dismiss button was tapped while the composer was open.
-            // Close the composer outright so it can never be left presented with the
-            // keyboard down.
+        func ghosttySurfaceViewDidRequestComposerFocus(_ surfaceView: GhosttySurfaceView) {
+            // The surface needs the composer presented (if not already) and its field
+            // re-focused, without dismissing it — the reveal-after-hide and
+            // present-while-suppressed paths. Ensure-present + bump the focus token the
+            // composer view observes, so the draft and its focus return together.
             Task { @MainActor [weak store] in
-                store?.dismissComposer()
-            }
-        }
-
-        func ghosttySurfaceViewDidCollapseKeyboard(_ surfaceView: GhosttySurfaceView) {
-            // The keyboard fully collapsed by ANY path (dismiss button, swipe-down,
-            // hardware keyboard, backgrounding). Collapse the composer too so
-            // `composerPresented ⇒ keyboardUp` holds by construction. Idempotent: a
-            // no-op when the composer is already closed.
-            Task { @MainActor [weak store] in
-                store?.dismissComposer()
+                store?.presentAndFocusComposer()
             }
         }
 
@@ -350,6 +402,34 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
                 responder = current.next
             }
             return view.window?.rootViewController
+        }
+    }
+}
+
+extension GhosttySurfaceRepresentable.Coordinator: PHPickerViewControllerDelegate {
+    /// Handle the photo-picker result for the attachments button (item 5). Loads the
+    /// picked image and routes it through the SAME size-fit + image-attach path the
+    /// clipboard Paste button uses: try PNG, then a compressed JPEG, send the first
+    /// encoding that fits the mobile sync frame budget via
+    /// ``MobilePasteImageSizing/firstEncodingThatFits(_:)``, else report it too large.
+    public func picker(_ picker: PHPickerViewController, didFinishPicking results: [PHPickerResult]) {
+        picker.dismiss(animated: true)
+        guard let provider = results.first?.itemProvider,
+              provider.canLoadObject(ofClass: UIImage.self) else { return }
+        provider.loadObject(ofClass: UIImage.self) { [weak self] object, _ in
+            guard let image = object as? UIImage else { return }
+            Task { @MainActor [weak self] in
+                guard let self, let store = self.store else { return }
+                let sizing = MobilePasteImageSizing()
+                if let fitting = sizing.firstEncodingThatFits([
+                    (label: "png", encode: { image.pngData() }),
+                    (label: "jpg", encode: { image.jpegData(compressionQuality: 0.8) }),
+                ]) {
+                    await store.submitTerminalPasteImage(fitting.data, format: fitting.label)
+                } else {
+                    store.reportPasteImageTooLarge()
+                }
+            }
         }
     }
 }

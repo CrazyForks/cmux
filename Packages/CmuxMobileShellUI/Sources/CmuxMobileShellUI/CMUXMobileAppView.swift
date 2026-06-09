@@ -1,6 +1,8 @@
+import CmuxMobileBrowser
 import CmuxMobileShell
 import SwiftUI
 #if os(iOS)
+import CmuxMobileShellModel
 @preconcurrency import UIKit
 #elseif os(macOS)
 import AppKit
@@ -14,19 +16,56 @@ public struct CMUXMobileAppView: View {
     /// DEBUG-only; absent in release builds.
     @State private var dogfoodFeedbackModel: DogfoodFeedbackModel
     #endif
+    /// Phone-local browser surfaces, owned for the app's lifetime and injected
+    /// into the environment so the workspace detail view can present a browser
+    /// pane without threading the store through every intermediate view. Browser
+    /// state lives here (not in the shell store) because, unlike terminals, it
+    /// has no Mac-side counterpart and must survive `workspace.updated` re-syncs.
+    @State private var browserStore: BrowserSurfaceStore
+    #if os(iOS)
+    /// The first-run onboarding "seen" flag store, gating the one-time onboarding
+    /// screen ahead of the never-paired add-device state.
+    private let onboardingStore: MobileOnboardingStore
+    #endif
 
-    public init(store: CMUXMobileShellStore = .preview()) {
+    #if os(iOS)
+    /// Creates the app view.
+    /// - Parameters:
+    ///   - store: The shell store backing the workspace UI.
+    ///   - browserStore: Phone-local browser surfaces, injected into the
+    ///     environment for the workspace detail view's browser pane.
+    ///   - onboardingStore: The first-run onboarding "seen" flag store. Defaults
+    ///     to a `.standard`-backed store marked already-seen, so SwiftUI previews
+    ///     and ad-hoc construction never present onboarding.
+    public init(
+        store: CMUXMobileShellStore = .preview(),
+        browserStore: BrowserSurfaceStore = BrowserSurfaceStore(),
+        onboardingStore: MobileOnboardingStore = MobileOnboardingStore(defaults: .standard, forceSeen: true)
+    ) {
         _store = State(initialValue: store)
-        #if os(iOS) && DEBUG
+        _browserStore = State(initialValue: browserStore)
+        self.onboardingStore = onboardingStore
+        #if DEBUG
         let model = DogfoodFeedbackModel(submitter: DogfoodFeedbackUISubmitter(store: store))
         store.setDogfoodFeedbackModel(model)
         _dogfoodFeedbackModel = State(initialValue: model)
         #endif
     }
+    #else
+    public init(
+        store: CMUXMobileShellStore = .preview(),
+        browserStore: BrowserSurfaceStore = BrowserSurfaceStore()
+    ) {
+        _store = State(initialValue: store)
+        _browserStore = State(initialValue: browserStore)
+    }
+    #endif
 
     public var body: some View {
-        CMUXMobileRootView(store: store)
-            #if os(iOS) && DEBUG
+        #if os(iOS)
+        CMUXMobileRootView(store: store, onboardingStore: onboardingStore)
+            .environment(browserStore)
+            #if DEBUG
             // Host the floating dogfood pane as a normal in-hierarchy overlay so
             // SwiftUI's native hit-testing delivers BOTH the pill's tap and drag.
             // The previous passthrough `UIWindow` owned its own `hitTest`, which
@@ -40,5 +79,9 @@ public struct CMUXMobileAppView: View {
                 DogfoodPaneOverlayView(model: dogfoodFeedbackModel)
             }
             #endif
+        #else
+        CMUXMobileRootView(store: store)
+            .environment(browserStore)
+        #endif
     }
 }

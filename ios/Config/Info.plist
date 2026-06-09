@@ -55,6 +55,28 @@
 	<string>Scan cmux pairing QR codes from your Mac terminal.</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Connect to your Mac on the local network for cmux mobile pairing and terminal sync.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<!-- The in-app browser (WKWebView) loads pages the user navigates to,
+		     which include plain-HTTP sites and local dev servers (localhost,
+		     127.0.0.1, and RFC1918 private-LAN like 192.168.x). This key exempts
+		     ONLY WKWebView web content from ATS; the app's own API/auth/pairing
+		     traffic stays under ATS and still requires HTTPS. NSAllowsLocalNetworking
+		     alone would not cover routable private-LAN dev servers. -->
+		<key>NSAllowsArbitraryLoadsInWebContent</key>
+		<true/>
+		<!-- NSAllowsLocalNetworking only PERMITS cleartext HTTP to private/loopback
+		     addresses (RFC 1918 + .local); it never forces it. Dev tagged builds
+		     (LocalConfig.plist ApiBaseURL) point the web API at the Mac's LAN IP over
+		     http for dogfooding device-token registration + push. In Release the
+		     LocalConfig override is empty, so every request is HTTPS to cmux.com and
+		     this exception is inert (no cleartext LAN requests are ever made).
+		     Per-config Debug-only scoping is a follow-up; a string-substituted
+		     `$(VAR)` value is NOT used because Info.plist expansion yields a
+		     `<string>`, not the `<true/>` Boolean ATS requires. -->
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

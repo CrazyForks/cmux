@@ -298,9 +298,12 @@ final class MobileHostService {
     /// full status) reads this so the lists cannot drift; iOS gates features
     /// like rename/pin on the entries present here.
     ///
-    /// In DEBUG builds this also advertises `dogfood.v1`, the DEV dogfood
-    /// feedback round-trip (`dogfood.feedback.submit`). It is absent from
-    /// release builds, so a release client never sees the verb advertised.
+    /// This also advertises `dogfood.v1`, the agent feedback round-trip
+    /// (`dogfood.feedback.submit`). It is advertised on every build type so the
+    /// privileged Send Feedback path (offered only to `@manaflow.ai` users on an
+    /// active connection) works on Release (beta/prod) too; the sink itself is
+    /// still gated by the same-account Stack-auth check the rest of the mobile
+    /// data plane enforces.
     nonisolated static var mobileHostCapabilities: [String] {
         var capabilities = [
             "events.v1",
@@ -311,14 +314,16 @@ final class MobileHostService {
             "terminal.replay.v1",
             "terminal.viewport.v1",
             "workspace.actions.v1",
+            "dogfood.v1",
         ]
         #if DEBUG
-        // `dogfood.v1` is the P1 umbrella (the `dogfood.feedback.submit` sink).
-        // `dogfood.checklist`/`dogfood.feedback` are the P2 verbs the floating
-        // pane gates on: a P1-only Mac advertises only `dogfood.v1`, so a newer
-        // phone skips the checklist subscribe + fetch and never eats a
-        // `method_not_found`.
-        capabilities.append(contentsOf: ["dogfood.v1", "dogfood.checklist", "dogfood.feedback"])
+        // `dogfood.v1` is the P1 umbrella (the `dogfood.feedback.submit` sink) and
+        // is already advertised unconditionally above so the privileged Send
+        // Feedback path works on Release too. `dogfood.checklist`/`dogfood.feedback`
+        // are the P2 verbs the floating pane gates on: a P1-only Mac advertises
+        // only `dogfood.v1`, so a newer phone skips the checklist subscribe +
+        // fetch and never eats a `method_not_found`.
+        capabilities.append(contentsOf: ["dogfood.checklist", "dogfood.feedback"])
         #endif
         return capabilities
     }
@@ -371,6 +376,21 @@ final class MobileHostService {
         await auth.awaitBootstrapped()
         guard auth.isAuthenticated else { return nil }
         return auth.currentUser?.id
+    }
+
+    /// This Mac's authenticated Stack email, or `nil` when signed out or before
+    /// the auth graph is configured.
+    ///
+    /// The mobile data plane only accepts same-account connections, so the
+    /// caller is this Mac's own Stack account. The privileged agent feedback
+    /// sink (`dogfood.feedback.submit`) checks this email's domain at the trust
+    /// boundary, so a crafted RPC from a non-privileged account is rejected
+    /// regardless of which route the phone UI chose.
+    func currentAuthenticatedLocalUserEmail() async -> String? {
+        guard let auth else { return nil }
+        await auth.awaitBootstrapped()
+        guard auth.isAuthenticated else { return nil }
+        return auth.currentUser?.primaryEmail
     }
 
     #if DEBUG

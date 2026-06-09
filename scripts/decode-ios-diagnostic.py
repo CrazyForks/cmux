@@ -31,9 +31,9 @@ EVENT_CODES = {
     1: ("connect", ""),
     2: ("pairOk", ""),
     3: ("pairFail", ""),
-    4: ("renderGridLag", ""),
+    4: ("renderGridLag", "ms=queueWaitMs (RENDER)"),
     5: ("livenessResubscribe", ""),
-    6: ("streamEnded", ""),
+    6: ("streamEnded", "a=1cancel/0finished (RENDER)"),
     7: ("inputSeqBehind", "a=localSeq b=remoteSeq"),
     8: ("byteGap", ""),
     9: ("error", ""),
@@ -50,6 +50,11 @@ EVENT_CODES = {
     20: ("composerViewAppear", ""),
     21: ("composerViewDisappear", ""),
     22: ("composerFieldFocusChanged", "a=focused"),
+    23: ("composerActiveTransition", "ms=keyboardH a=active b=frOwner c=proxyIsFR"),
+    24: ("composerKeyboardToggleWhilePresented", "ms=keyboardH a=proxyWasFR b=frOwner"),
+    25: ("renderFrameApplied", "ms=gapSincePrev a=chunkBytes (RENDER)"),
+    26: ("renderBusySkipped", "a=inFlightMs (RENDER)"),
+    27: ("renderCompleted", "ms=renderMs (RENDER)"),
 }
 
 # InputResponderIdentity raw value -> name.

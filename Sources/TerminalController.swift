@@ -1142,25 +1142,32 @@ class TerminalController {
                 let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !trimmed.isEmpty else { continue }
 
-                if isEventsStreamRequest(trimmed) {
-                    if let response = authResponseIfNeeded(for: trimmed, authenticated: &authenticated) {
-                        guard writeSocketResponse(response, to: socket) else {
+                var shouldCloseSocket = false
+                autoreleasepool {
+                    if isEventsStreamRequest(trimmed) {
+                        if let response = authResponseIfNeeded(for: trimmed, authenticated: &authenticated) {
+                            if !writeSocketResponse(response, to: socket) {
+                                shouldCloseSocket = true
+                            }
                             return
                         }
-                        continue
-                    }
-                    handleEventsStreamRequest(trimmed, socket: socket)
-                    return
-                }
-
-                let result = processSocketLine(trimmed, authenticated: authenticated)
-                authenticated = result.authenticated
-                if let response = result.response {
-                    let didWriteResponse = writeSocketResponse(response, to: socket)
-                    publishSocketEvents(command: trimmed, response: response)
-                    guard didWriteResponse else {
+                        handleEventsStreamRequest(trimmed, socket: socket)
+                        shouldCloseSocket = true
                         return
                     }
+
+                    let result = processSocketLine(trimmed, authenticated: authenticated)
+                    authenticated = result.authenticated
+                    if let response = result.response {
+                        let didWriteResponse = writeSocketResponse(response, to: socket)
+                        publishSocketEvents(command: trimmed, response: response)
+                        if !didWriteResponse {
+                            shouldCloseSocket = true
+                        }
+                    }
+                }
+                if shouldCloseSocket {
+                    return
                 }
             }
         }
@@ -1254,17 +1261,145 @@ class TerminalController {
         if trimmed.hasPrefix("ERROR:") {
             return "error"
         }
-        if trimmed.hasPrefix("{"),
-           let data = trimmed.data(using: .utf8),
-           let dict = (try? JSONSerialization.jsonObject(with: data, options: [])) as? [String: Any] {
-            if let ok = dict["ok"] as? Bool {
-                return ok ? "ok" : "error"
-            }
-            if dict["error"] != nil {
+        if trimmed.hasPrefix("{") {
+            let prefix = trimmed.prefix(4096)
+            if topLevelJSONResponseStatus(in: prefix) == "error" {
                 return "error"
             }
         }
         return "ok"
+    }
+
+    private nonisolated static func topLevelJSONResponseStatus(in text: Substring) -> String? {
+        var index = text.startIndex
+        skipJSONWhitespace(in: text, index: &index)
+        guard index < text.endIndex, text[index] == "{" else { return nil }
+        index = text.index(after: index)
+
+        while index < text.endIndex {
+            skipJSONWhitespace(in: text, index: &index)
+            if index >= text.endIndex { return nil }
+            if text[index] == "}" { return nil }
+            if text[index] == "," {
+                index = text.index(after: index)
+                continue
+            }
+            guard text[index] == "\"",
+                  let key = scanJSONString(in: text, index: &index) else {
+                return nil
+            }
+            skipJSONWhitespace(in: text, index: &index)
+            guard index < text.endIndex, text[index] == ":" else { return nil }
+            index = text.index(after: index)
+            skipJSONWhitespace(in: text, index: &index)
+
+            if key == "error" {
+                return "error"
+            }
+            if key == "ok" {
+                if text[index...].hasPrefix("false") {
+                    return "error"
+                }
+                if text[index...].hasPrefix("true") {
+                    return "ok"
+                }
+            }
+            guard skipJSONValue(in: text, index: &index) else {
+                return nil
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func scanJSONString(in text: Substring, index: inout String.Index) -> String? {
+        guard index < text.endIndex, text[index] == "\"" else { return nil }
+        index = text.index(after: index)
+        var result = ""
+        var isEscaped = false
+        while index < text.endIndex {
+            let char = text[index]
+            index = text.index(after: index)
+            if isEscaped {
+                result.append(char)
+                isEscaped = false
+                continue
+            }
+            if char == "\\" {
+                isEscaped = true
+                continue
+            }
+            if char == "\"" {
+                return result
+            }
+            result.append(char)
+        }
+        return nil
+    }
+
+    private nonisolated static func skipJSONValue(in text: Substring, index: inout String.Index) -> Bool {
+        guard index < text.endIndex else { return false }
+        switch text[index] {
+        case "\"":
+            return scanJSONString(in: text, index: &index) != nil
+        case "{", "[":
+            return skipJSONContainer(in: text, index: &index)
+        default:
+            while index < text.endIndex {
+                switch text[index] {
+                case ",", "}":
+                    return true
+                default:
+                    index = text.index(after: index)
+                }
+            }
+            return true
+        }
+    }
+
+    private nonisolated static func skipJSONContainer(in text: Substring, index: inout String.Index) -> Bool {
+        guard index < text.endIndex else { return false }
+        let opener = text[index]
+        let closer: Character = opener == "{" ? "}" : "]"
+        var depth = 1
+        index = text.index(after: index)
+        var isInString = false
+        var isEscaped = false
+        while index < text.endIndex {
+            let char = text[index]
+            index = text.index(after: index)
+            if isInString {
+                if isEscaped {
+                    isEscaped = false
+                } else if char == "\\" {
+                    isEscaped = true
+                } else if char == "\"" {
+                    isInString = false
+                }
+                continue
+            }
+            if char == "\"" {
+                isInString = true
+            } else if char == opener {
+                depth += 1
+            } else if char == closer {
+                depth -= 1
+                if depth == 0 {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private nonisolated static func skipJSONWhitespace(in text: Substring, index: inout String.Index) {
+        while index < text.endIndex {
+            switch text[index] {
+            case " ", "\t", "\n", "\r":
+                index = text.index(after: index)
+            default:
+                return
+            }
+        }
     }
 
     private nonisolated static func debugLogSocketCommandEndIfNeeded(
@@ -1766,6 +1901,8 @@ class TerminalController {
             return v2Result(id: id, self.v2MobileTerminalViewport(params: params))
         case "mobile.terminal.scroll", "terminal.scroll":
             return v2Result(id: id, self.v2MobileTerminalScroll(params: params))
+        case "mobile.terminal.scroll_to_bottom", "terminal.scroll_to_bottom":
+            return v2Result(id: id, self.v2MobileTerminalScrollToBottom(params: params))
         case "mobile.terminal.mouse", "terminal.mouse":
             return v2Result(id: id, self.v2MobileTerminalMouse(params: params))
 
@@ -4846,16 +4983,16 @@ class TerminalController {
         }
         let childIds = parsedChildIds
         // When the caller explicitly listed children, refuse to create an
-        // anchor-only group if every one of them was ineligible (pinned or
-        // already an anchor of another group). The keyboard-shortcut path
+        // anchor-only group if every one of them was already an anchor of
+        // another group. The keyboard-shortcut path
         // already enforces this; the socket/CLI path used to return OK with
         // a fresh empty group, hiding the real failure.
         if childrenExplicit, !parsedChildIds.isEmpty {
             let ineligible: [String] = v2MainSync {
                 let existingAnchorIds = Set(tabManager.workspaceGroups.map(\.anchorWorkspaceId))
                 return parsedChildIds.compactMap { id -> String? in
-                    guard let tab = tabManager.tabs.first(where: { $0.id == id }) else { return nil }
-                    if tab.isPinned || existingAnchorIds.contains(id) {
+                    guard tabManager.tabs.contains(where: { $0.id == id }) else { return nil }
+                    if existingAnchorIds.contains(id) {
                         return id.uuidString
                     }
                     return nil
@@ -4864,7 +5001,10 @@ class TerminalController {
             if ineligible.count == parsedChildIds.count {
                 return .err(
                     code: "invalid_state",
-                    message: "All requested children are ineligible (pinned or already an anchor); ungroup or unpin them first",
+                    message: String(
+                        localized: "workspaceGroup.error.allChildrenAreAnchors",
+                        defaultValue: "All requested children are ineligible because they are already group anchors; ungroup them first"
+                    ),
                     data: ["ineligible_workspace_ids": ineligible]
                 )
             }
@@ -5009,20 +5149,19 @@ class TerminalController {
             guard let tab = tabManager.tabs.first(where: { $0.id == wsId }), hasGroup else {
                 return
             }
-            // addWorkspaceToGroup silently no-ops for pinned workspaces and
-            // for anchors of other groups. Confirm membership actually
-            // changed before reporting success so scripts don't get OK on a
-            // no-op.
+            // addWorkspaceToGroup silently no-ops for anchors of other
+            // groups. Confirm membership actually changed before reporting
+            // success so scripts don't get OK on a no-op.
             tabManager.addWorkspaceToGroup(workspaceId: wsId, groupId: gid)
             if tab.groupId == gid {
                 ok = true
             } else {
-                if tab.isPinned {
+                if tabManager.workspaceGroups.contains(where: { $0.id != gid && $0.anchorWorkspaceId == wsId }) {
                     failureCode = "invalid_state"
-                    failureMessage = "Workspace is pinned and cannot join a group"
-                } else if tabManager.workspaceGroups.contains(where: { $0.id != gid && $0.anchorWorkspaceId == wsId }) {
-                    failureCode = "invalid_state"
-                    failureMessage = "Workspace is the anchor of another group; ungroup it first"
+                    failureMessage = String(
+                        localized: "workspaceGroup.error.workspaceIsOtherGroupAnchor",
+                        defaultValue: "Workspace is the anchor of another group; ungroup it first"
+                    )
                 }
             }
         }
@@ -20720,15 +20859,21 @@ class TerminalController {
             result = v2MobileTerminalViewport(params: request.params)
         case "mobile.terminal.scroll", "terminal.scroll":
             result = v2MobileTerminalScroll(params: request.params)
+        case "mobile.terminal.scroll_to_bottom", "terminal.scroll_to_bottom":
+            result = v2MobileTerminalScrollToBottom(params: request.params)
         case "mobile.terminal.mouse", "terminal.mouse":
             result = v2MobileTerminalMouse(params: request.params)
         case "workspace.action":
             result = v2MobileWorkspaceAction(params: request.params)
         case "notification.dismiss":
             result = v2MobileNotificationDismiss(params: request.params)
-#if DEBUG
+        case "mobile.notifications.list", "notifications.list":
+            result = v2MobileNotificationsList(params: request.params)
+        case "mobile.notifications.mark_read", "notifications.mark_read":
+            result = v2MobileNotificationsMarkRead(params: request.params)
         case "dogfood.feedback.submit":
             result = await v2MobileDogfoodFeedbackSubmit(params: request.params)
+#if DEBUG
         case "dogfood.checklist.fetch":
             result = v2MobileDogfoodChecklistFetch()
 #endif
@@ -20740,13 +20885,93 @@ class TerminalController {
         return mobileHostResult(result)
     }
 
-#if DEBUG
-    /// Hard caps for the DEV dogfood feedback sink. A debug client is the only
-    /// caller, but a malformed or hostile request must not be able to allocate
-    /// huge buffers, block the Mac UI, or grow the cache without bound. Strings
-    /// are capped by character count before any large allocation; the base64
-    /// blob is rejected outright past its cap (so it is never decoded), and a
-    /// decoded blob past the byte cap is dropped.
+    /// `mobile.notifications.list`: the recent notification feed the iOS
+    /// Notifications hub mirrors. Reads `TerminalNotificationStore.shared`, sorts
+    /// newest-first, caps to the recent window, and maps to a snake_case wire
+    /// shape with `created_at` as Unix epoch seconds (the phone decodes it into a
+    /// `Date`). This is the snapshot the phone pulls on cold-attach and on every
+    /// `notifications.updated` signal.
+    ///
+    /// Authorization: like `workspace.list`, this returns the user's own state
+    /// across all of their Mac's workspaces and is account-scoped by same-account
+    /// Stack auth, which is the SOLE authorization gate for the mobile data plane
+    /// (`MobileHostService.authorizationError(for:)`). The attach ticket is
+    /// route-discovery + workspace-selection only and never authorizes on its
+    /// own, and `mobile.attach_ticket.create` itself requires the same-account
+    /// Stack token to mint, so every caller here is the Mac owner reading their
+    /// own notifications. Confining the feed to a single workspace (cross-account
+    /// or scoped sharing) would require a data-plane-wide scope model, not a
+    /// notifications-only check, and is out of scope for this foundation.
+    private func v2MobileNotificationsList(params: [String: Any]) -> V2CallResult {
+        let recent = TerminalNotificationStore.shared.notifications
+            .sorted { $0.createdAt > $1.createdAt }
+            .prefix(Self.mobileNotificationRecentLimit)
+        let items: [[String: Any]] = recent.map { notification in
+            [
+                "id": notification.id.uuidString,
+                "workspace_id": notification.tabId.uuidString,
+                // The workspace's display title, so the feed row can name which
+                // workspace/Mac the notification came from (titles are activity
+                // strings like "Claude finished" with no workspace context).
+                // Null when the workspace has closed or has no title.
+                "workspace_name": v2OrNull(AppDelegate.shared?.tabTitle(for: notification.tabId)),
+                "surface_id": v2OrNull(notification.surfaceId?.uuidString),
+                "title": notification.title,
+                "subtitle": notification.subtitle,
+                "body": notification.body,
+                "created_at": notification.createdAt.timeIntervalSince1970,
+                "is_read": notification.isRead,
+            ]
+        }
+        return .ok(["notifications": items])
+    }
+
+    /// `mobile.notifications.mark_read`: mark a single notification (`id`) or a
+    /// whole workspace (`workspace_id`) read on the Mac. Routes through the same
+    /// `TerminalNotificationStore` read-state path the Mac UI uses (no parallel
+    /// copy), so the Mac stops re-notifying and the store change re-emits
+    /// `notifications.updated` to reconcile every connected phone.
+    private func v2MobileNotificationsMarkRead(params: [String: Any]) -> V2CallResult {
+        // Reject any present-but-invalid selector first. This is a mutating RPC
+        // at a trust boundary: a malformed `id` alongside a valid `workspace_id`
+        // must NOT silently downgrade to a broader workspace-wide mark-read than
+        // the caller asked for. Mirrors `v2MobileWorkspaceList`'s
+        // `v2HasNonNullParam`-guarded UUID validation.
+        let id = v2UUID(params, "id")
+        if v2HasNonNullParam(params, "id"), id == nil {
+            return .err(code: "invalid_params", message: "Missing or invalid id", data: nil)
+        }
+        let workspaceID = v2UUID(params, "workspace_id")
+        if v2HasNonNullParam(params, "workspace_id"), workspaceID == nil {
+            return .err(code: "invalid_params", message: "Missing or invalid workspace_id", data: nil)
+        }
+        // Exactly one selector. Both/neither is a client bug, not a partial op.
+        let selectorCount = (id == nil ? 0 : 1) + (workspaceID == nil ? 0 : 1)
+        guard selectorCount == 1 else {
+            return .err(
+                code: "invalid_params",
+                message: "Provide exactly one of id or workspace_id",
+                data: nil
+            )
+        }
+        if let id {
+            TerminalNotificationStore.shared.markRead(id: id)
+        } else if let workspaceID {
+            TerminalNotificationStore.shared.markRead(forTabId: workspaceID)
+        }
+        return .ok(["ok": true])
+    }
+
+    /// Recent-notification window the mobile feed mirrors. Kept in sync with the
+    /// phone-side `MobileNotificationsStore.recentLimit` and the observer hash.
+    private static let mobileNotificationRecentLimit = 200
+
+    /// Hard caps for the agent feedback sink. The only intended caller is a
+    /// paired phone, but a malformed or hostile request must not be able to
+    /// allocate huge buffers, block the Mac UI, or grow the cache without bound.
+    /// Strings are capped by character count before any large allocation; the
+    /// base64 blob is rejected outright past its cap (so it is never decoded),
+    /// and a decoded blob past the byte cap is dropped.
     nonisolated private static let dogfoodFeedbackMaxTextChars = 16_384
     nonisolated private static let dogfoodFeedbackMaxTerminalChars = 262_144
     nonisolated private static let dogfoodFeedbackMaxBuildStampChars = 512
@@ -20763,17 +20988,31 @@ class TerminalController {
     /// each write so a retrying client can't grow the cache without bound.
     nonisolated private static let dogfoodFeedbackMaxRetainedBundles = 50
 
-    /// DEV-only dogfood feedback sink (P1 + P2 of the Mac↔phone feedback loop).
+    /// The privileged feedback domain. Mirrors `isManaflowEmail` in
+    /// `CmuxMobileShellModel` (the phone's routing source of truth) but is
+    /// replicated here so the macOS app target need not link that mobile
+    /// package just for this one suffix check. Trims + lowercases before
+    /// matching so stored casing/padding does not bypass the gate.
+    nonisolated static func isPrivilegedFeedbackEmail(_ email: String?) -> Bool {
+        guard let email else { return false }
+        let normalized = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized.hasSuffix("@manaflow.ai")
+    }
+
+    /// Privileged agent feedback sink (P1 + P2 of the Mac↔phone feedback loop).
     ///
     /// Decodes `{ text, terminal_text, build_stamp, diagnostic_blob_base64 }`
     /// plus the P2-additive `{ answers_json, screenshot_png_base64 }`, writes a
     /// self-contained bundle directory under
     /// `~/.cache/cmux-dogfood-feedback/<ISO8601>_<shortid>/` (a `bundle.json`
     /// manifest, the decoded `diagnostic.log`, and `screenshot.png` when present),
-    /// and returns the bundle path. Gated behind `#if DEBUG` and the same-account
-    /// Stack-auth authorization the rest of the mobile data plane enforces, so it
-    /// never exists in a release build and never accepts an unauthenticated
-    /// caller.
+    /// and returns the bundle path. It is protected by the same-account Stack-auth
+    /// authorization the rest of the mobile data plane enforces, so it never
+    /// accepts an unauthenticated caller, and by the `isPrivilegedFeedbackEmail`
+    /// check at the trust boundary. The phone only ever routes here for
+    /// `@manaflow.ai` users on an active connection, so this exists in Release
+    /// builds too (the team can dogfood beta/prod), and only a Mac that runs the
+    /// watcher acts on it.
     ///
     /// Field sizes are capped on the main actor *before* any large allocation,
     /// invalid/oversized base64 is rejected without decoding, and the decode +
@@ -20781,6 +21020,22 @@ class TerminalController {
     /// the Mac UI. The P2 fields are optional, so a P1 phone's request is handled
     /// exactly as before.
     private func v2MobileDogfoodFeedbackSubmit(params: [String: Any]) async -> V2CallResult {
+        // Privilege check at the trust boundary: the mobile data plane only
+        // accepts same-account connections, so the caller is this Mac's own Stack
+        // account. The privileged agent feedback sink is restricted to the
+        // @manaflow.ai domain; a crafted RPC from any other account is rejected
+        // here regardless of which route the phone UI chose. (The phone also
+        // gates the route on `@manaflow.ai` + `dogfood.v1`, but the Mac is the
+        // real boundary.)
+        let localEmail = await MobileHostService.shared.currentAuthenticatedLocalUserEmail()
+        guard Self.isPrivilegedFeedbackEmail(localEmail) else {
+            return .err(
+                code: "unauthorized",
+                message: "Feedback agent sink is restricted to privileged accounts",
+                data: nil
+            )
+        }
+
         // Cheap main-actor validation first: cap each field by character count
         // before allocating anything large, and reject an oversized base64 blob
         // outright so it is never decoded into a giant Data.
@@ -20988,7 +21243,6 @@ class TerminalController {
             try? fileManager.removeItem(at: stale)
         }
     }
-#endif
 
     /// Mark notifications read on the Mac in response to the user dismissing the
     /// mirrored banner on a paired phone. Accepts either a single `notification_id`
@@ -21672,6 +21926,31 @@ class TerminalController {
             terminalPanel.surface.mobileScroll(deltaLines: deltaLines, col: max(0, col), row: max(0, row))
             MobileTerminalRenderObserver.shared.noteTerminalBytes(surfaceID: terminalPanel.id)
         }
+        return .ok([
+            "workspace_id": resolved.workspace.id.uuidString,
+            "surface_id": surfaceId.uuidString,
+        ])
+    }
+
+    /// Jump the resolved mobile surface's real Mac viewport to the live bottom,
+    /// out of scrollback. The phone's jump-to-latest button routes here because
+    /// its display-only mirror has no local scrollback to pop. Notes the byte
+    /// change so a fresh render-grid frame (now carrying `atBottom == true`)
+    /// flows back and the button self-hides.
+    private func v2MobileTerminalScrollToBottom(params: [String: Any]) -> V2CallResult {
+        if let error = mobileWorkspaceIDValidationError(params: params) {
+            return error
+        }
+        if let error = mobileTerminalAliasValidationError(params: params) {
+            return error
+        }
+        guard let resolved = mobileResolveWorkspaceAndSurface(params: params, requireTerminal: true),
+              let surfaceId = resolved.surfaceId,
+              let terminalPanel = resolved.workspace.terminalPanel(for: surfaceId) else {
+            return .err(code: "not_found", message: "Terminal surface not found", data: nil)
+        }
+        terminalPanel.surface.mobileScrollToBottom()
+        MobileTerminalRenderObserver.shared.noteTerminalBytes(surfaceID: terminalPanel.id)
         return .ok([
             "workspace_id": resolved.workspace.id.uuidString,
             "surface_id": surfaceId.uuidString,

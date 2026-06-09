@@ -18,17 +18,20 @@ public enum DiagnosticEventCode: UInt16, Sendable, Codable, CaseIterable {
     case pairOk = 2
     /// Pairing / attach failed.
     case pairFail = 3
-    /// The render-grid stream lagged behind (a bounded render-lag counter tick).
-    ///
-    /// Reserved for the render hot path in `GhosttySurfaceView` (the existing
-    /// `oq.render.LAG` site). It is part of the export vocabulary now, but not
-    /// emitted from the shell: instrumenting the per-frame render seam is a
-    /// deeper injection deferred past P1, and the spec caps render-path
-    /// instrumentation at a single bounded counter.
+    /// The render-grid render queue lagged: a `render_now` waited a long time behind
+    /// other ops on the serial output queue before running. `ms` = the measured queue
+    /// wait in milliseconds. Round 8 emits this from `GhosttySurfaceView.requestRender`
+    /// (the `oq.render.LAG` site) so the render-busy path lands in the export, not just
+    /// the time-gated string log — the "terminal frozen, input alive" signal.
     case renderGridLag = 4
     /// The liveness watchdog forced a re-subscribe after a silent stream.
     case livenessResubscribe = 5
-    /// The render-grid push stream ended and fell back to polling.
+    /// The render-grid push/output stream the surface consumes (`for await` in
+    /// `GhosttySurfaceRepresentable.Coordinator`) ended. `a` = 1 if it ended on an
+    /// explicit cancel (surface teardown), else 0 (the stream finished on its own — a
+    /// possible silent wedge where the consumer stops receiving frames while input
+    /// still works). Round 8 emits this so a frozen-render Capture&Send shows whether
+    /// the render-grid consumer loop is still alive.
     case streamEnded = 6
     /// The local input sequence fell behind the remote-applied sequence.
     case inputSeqBehind = 7
@@ -147,4 +150,37 @@ public enum DiagnosticEventCode: UInt16, Sendable, Codable, CaseIterable {
     /// that can strand the composer with the keyboard down, so round 5's "dismiss
     /// the composer too" handling can be confirmed (or the residual case named).
     case composerKeyboardToggleWhilePresented = 24
+
+    // MARK: iOS render-grid consumer instrumentation (Round 8 frozen-render hunt)
+    //
+    // Lawrence hit "terminal frozen but keystrokes reach macOS": input is alive
+    // (a separate RPC path) while the render-grid CONSUMER is wedged. The prior
+    // rounds instrumented input/responder only, so a frozen render could not be
+    // localized. These codes instrument the render-grid consumer seam — the output
+    // `for await` stream liveness, the off-main `render_now` busy/skip state, and the
+    // applied-frame timeline — so a single Capture&Send pinpoints whether the stream
+    // stopped delivering, the render queue wedged, or frames stopped applying. They
+    // ride the lock-free ``DiagnosticLog/record(_:)`` hot-path sink (no per-frame
+    // string log). Decode with `scripts/decode-ios-diagnostic.py`. Tagged "RENDER:".
+
+    /// A render-grid output chunk was applied to the libghostty surface (the main hop
+    /// in `GhosttySurfaceView.processOutput`). Time-gated (≈1/s) so it is a heartbeat,
+    /// not a per-byte flood. `ms` = milliseconds since the previous applied chunk, so a
+    /// growing gap (or this event ceasing) localizes a stalled consumer while input
+    /// still works. `a` = the chunk's byte length. RENDER: frame-apply timestamp.
+    case renderFrameApplied = 25
+
+    /// A `render_now` could not be dispatched because one was already in flight on the
+    /// serial output queue (`GhosttySurfaceView.requestRender` coalesce). `a` =
+    /// milliseconds the current render has been in flight so far. A long, climbing
+    /// value with the screen frozen is the "render busy / snapshot skipped" wedge —
+    /// the render queue is backed up while input (a separate path) still works.
+    /// RENDER: render-busy / snapshot-skipped state.
+    case renderBusySkipped = 26
+
+    /// One `render_now` completed. `ms` = how long it was in flight (enqueue →
+    /// main-hop completion), in milliseconds. Normal renders are a few ms; a spike with
+    /// a frozen screen confirms the GPU/swap-chain `render_now` itself stalled rather
+    /// than the stream drying up. RENDER: render-busy duration.
+    case renderCompleted = 27
 }

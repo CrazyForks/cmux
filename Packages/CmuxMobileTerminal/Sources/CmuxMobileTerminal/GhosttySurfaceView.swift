@@ -55,6 +55,11 @@ public protocol GhosttySurfaceViewDelegate: AnyObject {
     /// The user tapped the "customize" button at the end of the input-accessory
     /// bar; the host should present the toolbar shortcuts editor. Optional.
     func ghosttySurfaceViewDidRequestToolbarSettings(_ surfaceView: GhosttySurfaceView)
+    /// The user tapped the attachments button on the input-accessory bar; the host
+    /// should present the iOS photo/file picker and route any picked image through
+    /// the existing image-attach path (``ghosttySurfaceView(_:didPasteImage:format:)``).
+    /// Optional.
+    func ghosttySurfaceViewDidRequestAttachment(_ surfaceView: GhosttySurfaceView)
     /// Forward an image the user pasted from the system clipboard. The host
     /// uploads `data` to the Mac, which materializes a temp file and injects its
     /// path into the terminal so a running TUI (e.g. Claude Code) attaches it.
@@ -66,22 +71,18 @@ public protocol GhosttySurfaceViewDelegate: AnyObject {
     func ghosttySurfaceViewDidFailToPasteImageTooLarge(_ surfaceView: GhosttySurfaceView)
     /// The composer accessory button was tapped; the host should toggle the
     /// iMessage-style composer above the terminal. Optional.
+    ///
+    /// Round 8: the composer is dismissed ONLY by its own chevron or this toggle. The
+    /// keyboard collapsing no longer dismisses the composer (it survives a keyboard-down
+    /// and the toolbar stays visible), so there is no separate collapse/dismiss
+    /// delegate hook anymore.
     func ghosttySurfaceViewDidRequestComposerToggle(_ surfaceView: GhosttySurfaceView)
-    /// The keyboard-dismiss button was tapped while the composer is open; the host
-    /// should DISMISS the composer (not just hide the keyboard) so the composer can
-    /// never be left presented with the keyboard down. Optional. Keeping a single
-    /// "close" intent for the composing case avoids the round-4 edge case where
-    /// hiding the keyboard left the composer stranded on screen.
-    func ghosttySurfaceViewDidRequestComposerDismiss(_ surfaceView: GhosttySurfaceView)
-    /// The software keyboard fully collapsed (height went to zero) by ANY path:
-    /// the dismiss button, an interactive swipe-down, an attached hardware
-    /// keyboard, or the app backgrounding. The host should collapse the composer
-    /// too, so `composerPresented ⇒ keyboardUp` holds by construction and the
-    /// composer can never be left on screen with the keyboard down. Idempotent on
-    /// the host side (a no-op when the composer is already closed). This is the
-    /// single structural enforcement point that replaces the per-button dismiss
-    /// special-casing.
-    func ghosttySurfaceViewDidCollapseKeyboard(_ surfaceView: GhosttySurfaceView)
+    /// The surface needs the iMessage-style composer presented (if it is not already)
+    /// and its field re-focused, without dismissing it. The host ensures the composer
+    /// is presented and bumps the focus token the composer view observes. Used on the
+    /// reveal-after-hide and the present-while-suppressed paths so the draft and its
+    /// focus return together. Optional.
+    func ghosttySurfaceViewDidRequestComposerFocus(_ surfaceView: GhosttySurfaceView)
     /// Forward a committed block of text (system dictation, an autocorrect
     /// replacement, or keyboard-inserted clipboard text) that should reach the
     /// remote terminal as a bracketed paste rather than per-character input. The
@@ -89,17 +90,23 @@ public protocol GhosttySurfaceViewDelegate: AnyObject {
     /// fragment into separate Returns. Defaults to the raw-input path so existing
     /// conformers keep working. Optional.
     func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didPasteText text: String)
+    /// The user tapped the floating jump-to-bottom button; the host should ask
+    /// the Mac's real surface to scroll all the way to the live bottom (out of
+    /// scrollback). The mirror has no local scrollback, so this cannot be done
+    /// on-device. Optional.
+    func ghosttySurfaceViewDidRequestScrollToBottom(_ surfaceView: GhosttySurfaceView)
 }
 
 public extension GhosttySurfaceViewDelegate {
     func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didScrollLines lines: Double, atCol col: Int, row: Int) {}
     func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didTapAtCol col: Int, row: Int) {}
     func ghosttySurfaceViewDidRequestToolbarSettings(_ surfaceView: GhosttySurfaceView) {}
+    func ghosttySurfaceViewDidRequestAttachment(_ surfaceView: GhosttySurfaceView) {}
     func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didPasteImage data: Data, format: String) {}
     func ghosttySurfaceViewDidFailToPasteImageTooLarge(_ surfaceView: GhosttySurfaceView) {}
     func ghosttySurfaceViewDidRequestComposerToggle(_ surfaceView: GhosttySurfaceView) {}
-    func ghosttySurfaceViewDidRequestComposerDismiss(_ surfaceView: GhosttySurfaceView) {}
-    func ghosttySurfaceViewDidCollapseKeyboard(_ surfaceView: GhosttySurfaceView) {}
+    func ghosttySurfaceViewDidRequestComposerFocus(_ surfaceView: GhosttySurfaceView) {}
+    func ghosttySurfaceViewDidRequestScrollToBottom(_ surfaceView: GhosttySurfaceView) {}
     /// Default bracketed-paste handler that falls back to per-character input.
     ///
     /// A conformer that does not implement the bracketed-paste path still
@@ -742,6 +749,19 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// Time of the most recent applied render-grid output, for the heartbeat's
     /// `sinceOutput` field (ties an idle blank to a stream gap).
     private var lastOutputAppliedTime: CFTimeInterval = 0
+    /// Time-gate stamp for the ``DiagnosticEventCode/renderFrameApplied`` heartbeat so
+    /// it records ≈1/s instead of per output chunk (RENDER: frame-apply).
+    private var lastRenderFrameDiagTime: CFTimeInterval = 0
+    /// Time-gate stamp for the ``DiagnosticEventCode/renderBusySkipped`` event so a
+    /// continuous render-coalesce burst records ≈1/s, not per skipped frame.
+    private var lastRenderBusyDiagTime: CFTimeInterval = 0
+    /// Media time the in-flight `render_now` was enqueued, for the busy/duration
+    /// RENDER: events. 0 when no render is in flight.
+    private var renderInFlightStart: CFTimeInterval = 0
+    /// Only a `render_now` slower than this (ms) records a
+    /// ``DiagnosticEventCode/renderCompleted`` event, so the bounded diagnostic ring is
+    /// not flooded by normal fast renders at 120fps.
+    private static let renderCompletedSlowThresholdMs: Double = 50
     #endif
     /// Set by any geometry trigger (resize/zoom/keyboard/effective-grid pin);
     /// the display link applies geometry at most once per frame. Coalescing
@@ -781,6 +801,72 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         proxy.accessibilityIdentifier = "MobileTerminalSurface"
         return proxy
     }()
+
+    /// DEBUG/UI-test accessibility carrier for the surface's live bottom-dock state.
+    ///
+    /// Exposes the four dock bits the round-9 reducer turns on
+    /// (``ComposerDockState``) plus the last resolved ``ComposerDockIntent`` and the
+    /// terminal proxy's first-responder status as a stable, parseable
+    /// `accessibilityValue` string so an XCUITest can assert the surface's internal
+    /// composer state precisely across repeated open/close cycles — the discriminating
+    /// seam for the "composer jank" repro. Non-interactive, off-screen (1×1 at the
+    /// origin) so it never intercepts taps or perturbs layout; it carries no rendered
+    /// text (that stays on ``debugAccessibilityProxy``).
+    ///
+    /// The value is computed live on every accessibility READ (not cached on a
+    /// transition), because `fieldFocused`/`proxyFirstResponder` flip a runloop after
+    /// the synchronous transition (the focus token / `@FocusState` are deferred). An
+    /// XCUITest predicate-wait re-reads the element until it converges, so a live getter
+    /// is the only thing that lets the test see the SETTLED post-transition state.
+    private lazy var composerDockProbe: ComposerDockProbeView = {
+        let probe = ComposerDockProbeView(frame: CGRect(x: 0, y: 0, width: 1, height: 1))
+        probe.backgroundColor = .clear
+        probe.isUserInteractionEnabled = false
+        probe.isAccessibilityElement = true
+        probe.accessibilityIdentifier = "MobileComposerDockProbe"
+        probe.surface = self
+        return probe
+    }()
+
+    /// The last ``ComposerDockIntent`` ``handleComposerButtonTap()`` resolved, recorded
+    /// purely so the dock probe can report it to the UI test. `nil` until the first
+    /// compose-button tap.
+    fileprivate var lastComposerDockIntent: ComposerDockIntent?
+
+    /// The live `key=value;…` description of the bottom dock, read by
+    /// ``ComposerDockProbeView`` on every accessibility query. `fieldFocused` is the
+    /// SAME ``composerFieldIsFirstResponder`` walk the reducer reads, so the probe and
+    /// the real decision can never disagree.
+    fileprivate var composerDockProbeValue: String {
+        let intent: String
+        switch lastComposerDockIntent {
+        case .openComposer: intent = "open"
+        case .revealAndFocusComposer: intent = "reveal"
+        case .closeComposer: intent = "close"
+        case nil: intent = "none"
+        }
+        // Toolbar horizontal geometry, to localize the hide→reveal "compose button
+        // off-screen" jank. `surfaceMinXInWindow` is exactly what
+        // `accessoryLayoutInsetsProvider` feeds into the toolbar's leading inset; if it
+        // is wrong during a reveal reflow the button row shifts. `toolbarOriginX` is the
+        // docked container's own X (set to 0 by `layoutBottomDock`), so a nonzero value
+        // here, or a large `surfaceMinXInWindow`, points at the displacement source.
+        let surfaceMinXInWindow = window.map { Int(convert(bounds, to: $0).minX) } ?? -1
+        let toolbarOriginX = dockedToolbar.map { Int($0.frame.minX) } ?? -1
+        return [
+            "chromeHidden=\(chromeHidden ? 1 : 0)",
+            "composerActive=\(composerActive ? 1 : 0)",
+            "fieldFocused=\(composerFieldIsFirstResponder ? 1 : 0)",
+            "keyboardUp=\(keyboardHeight > 0 ? 1 : 0)",
+            "proxyFirstResponder=\(inputProxy.isFirstResponder ? 1 : 0)",
+            "bandMounted=\(composerContainer.subviews.isEmpty ? 0 : 1)",
+            "toolbarVisible=\(dockedToolbar?.isHidden == false ? 1 : 0)",
+            "surfaceMinXInWindow=\(surfaceMinXInWindow)",
+            "toolbarOriginX=\(toolbarOriginX)",
+            "lastIntent=\(intent)",
+            inputProxy.accessoryLayoutDiagnostics,
+        ].joined(separator: ";")
+    }
     #endif
     private let snapshotFallbackView: UITextView = {
         let view = UITextView()
@@ -961,26 +1047,15 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         }
         inputProxy.onToggleComposer = { [weak self] in
             guard let self else { return }
-            self.delegate?.ghosttySurfaceViewDidRequestComposerToggle(self)
+            self.handleComposerButtonTap()
         }
         inputProxy.onHideKeyboard = { [weak self] in
             guard let self else { return }
+            #if DEBUG
+            // The keyboard-toggle was tapped while composing. Round 8 no longer
+            // dismisses the composer here (the composer survives a keyboard-down), so
+            // this is now purely diagnostic.
             if self.composerActive {
-                // Round 5 edge case fix: while the composer is open, the composer's
-                // text field (not `inputProxy`) is first responder, so the old
-                // `inputProxy.isFirstResponder` branch fell through to `focusInput()`
-                // and left the composer presented with the keyboard down. The
-                // keyboard-dismiss button while composing should close the composer
-                // outright so the two states can never desync. The host dismisses the
-                // composer, which collapses it and tears down its field consistently.
-                #if DEBUG
-                // Mirror the data code 23 captures so a single Capture&Send trace is
-                // conclusive about the dismiss-tap that can strand the composer with
-                // the keyboard down: `a` = proxy-was-FR, `b` = the resolved FR owner
-                // identity at the tap (which view actually held FR), `ms` = the
-                // surface's keyboardHeight at the tap. Without `b`/`ms`, code 24 only
-                // knew the proxy's own FR state, not who owned FR or whether the
-                // keyboard was already collapsing.
                 let frOwner = TerminalInputTextView.responderIdentity(of: CurrentResponderProbe.current())
                 self.diagnosticLog?.record(DiagnosticEvent(
                     .composerKeyboardToggleWhilePresented,
@@ -988,28 +1063,34 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
                     a: self.inputProxy.isFirstResponder ? 1 : 0,
                     b: frOwner.rawValue
                 ))
-                #endif
-                // The user tapped "hide keyboard" while composing, so they want the
-                // keyboard DOWN. The composer's hosted field (not `inputProxy`) holds
-                // first responder, so resign it here to start the keyboard hide; that
-                // drops `keyboardHeight` to 0 before the composer's own teardown runs,
-                // so `setComposerActive(false)`'s re-focus guard (`keyboardHeight > 0`)
-                // correctly skips re-summoning the keyboard. Then dismiss the composer
-                // so the two states collapse together.
-                self.composerContainer.endEditing(true)
-                self.delegate?.ghosttySurfaceViewDidRequestComposerDismiss(self)
-                return
             }
-            // Toggle: dismiss when the keyboard is up, bring it back when down.
-            if self.inputProxy.isFirstResponder {
-                self.resignInput()
+            #endif
+            // Round 8: the keyboard-toggle button only raises/lowers the keyboard. The
+            // toolbar stays visible either way, and an open composer survives a
+            // keyboard-down (its draft lives in the store; the field just loses focus).
+            // While composing, the composer's hosted field — not `inputProxy` — holds
+            // first responder, so resign through the container to drop the keyboard;
+            // otherwise toggle the terminal input proxy.
+            if self.keyboardHeight > 0 {
+                if self.composerActive {
+                    self.composerContainer.endEditing(true)
+                } else {
+                    self.resignInput()
+                }
             } else {
                 self.focusInput()
             }
         }
+        inputProxy.onHideChrome = { [weak self] in
+            self?.setChromeHidden(true)
+        }
         inputProxy.onOpenToolbarSettings = { [weak self] in
             guard let self else { return }
             self.delegate?.ghosttySurfaceViewDidRequestToolbarSettings(self)
+        }
+        inputProxy.onOpenAttachments = { [weak self] in
+            guard let self else { return }
+            self.delegate?.ghosttySurfaceViewDidRequestAttachment(self)
         }
         inputProxy.accessoryLayoutInsetsProvider = { [weak self] in
             guard let self,
@@ -1047,6 +1128,7 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         addSubview(inputProxy)
         #if DEBUG
         addSubview(debugAccessibilityProxy)
+        addSubview(composerDockProbe)
         #endif
         installPersistentToolbar()
         installComposerContainer()
@@ -1227,6 +1309,15 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// flush with the grid bottom (no gap) and its bottom rests on the keyboard
     /// edge (up) or above the home indicator (down).
     private weak var dockedToolbar: UIView?
+    /// The floating jump-to-bottom button. Installed lazily alongside the docked
+    /// toolbar, positioned bottom-right just above the toolbar/composer/keyboard
+    /// reserve in ``layoutBottomDock()``, and shown only while ``scrolledUp`` is
+    /// true (the Mac reported the viewport is scrolled up into scrollback).
+    private weak var scrollToBottomButton: ScrollToBottomButton?
+    /// Whether the terminal is scrolled up (has room to jump to the live bottom),
+    /// pushed down from the render-grid producer's authoritative position via
+    /// ``setScrolledUp(_:)``. Drives ``scrollToBottomButton`` visibility.
+    private var scrolledUp = false
     /// Whether the iMessage-style composer is currently open. The surface owns the
     /// whole bottom dock (terminal grid / composer band / toolbar / keyboard) in ONE
     /// coordinate system, so `composerActive` only drives the first-responder
@@ -1313,17 +1404,19 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         #endif
         keyboardHeight = 0
         inputProxy.setKeyboardShown(false)
-        // The keyboard fully collapsed by SOME path (dismiss button, swipe-down,
-        // hardware keyboard, or backgrounding). Tell the host so it collapses the
-        // composer too: this is the single structural enforcement of
-        // `composerPresented ⇒ keyboardUp`, replacing the per-button dismiss
-        // special-casing. The host is idempotent, so firing this when the composer is
-        // already closed is harmless. Once the composer closes, `setComposerActive`
-        // zeroes the band, so the dock collapses to just the toolbar (hidden, since the
-        // keyboard is down).
-        delegate?.ghosttySurfaceViewDidCollapseKeyboard(self)
-        // Keyboard going down hides the docked bar and releases its reserved grid
-        // height so the terminal reclaims the space.
+        // Round 8 removes the `composerPresented ⇒ keyboardUp` enforcement: the
+        // toolbar is ALWAYS visible and the composer band survives a keyboard-down, so
+        // the keyboard collapsing no longer dismisses the composer. The composer's
+        // draft lives in the store (`terminalInputText`), so the field just loses focus
+        // and its text stays; tapping it refocuses and re-raises the keyboard. The
+        // composer is dismissed only by its chevron or the toolbar composer button.
+        //
+        // The toolbar stays visible while the keyboard is down (it now rides the bottom
+        // safe area), so visibility does not change here. Re-seat the dock and re-sync
+        // the grid: `keyboardOccupancyInBounds` flips from the keyboard height to the
+        // safe-area inset, so the dock drops to ride the home indicator and the grid
+        // reclaims the keyboard's space (minus the now-reserved safe area + toolbar +
+        // composer band).
         updateDockedToolbarVisibility()
         animateDockedToolbar(with: notification)
         setNeedsGeometrySync()
@@ -1367,35 +1460,129 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         let toolbar = inputProxy.toolbarView
         addSubview(toolbar)
         dockedToolbar = toolbar
-        // The bar is keyboard-tied: it shows only while the keyboard is up. At
-        // install the keyboard is down, so start hidden with no reserved grid
-        // height; `updateDockedToolbarVisibility()` reveals it on keyboard-up.
+        // Raise the toolbar above the Ghostty renderer's own sublayer (which it
+        // inserts directly into `self.layer`), so a dragged/lifted Liquid-Glass button
+        // floating UP over the terminal is not occluded or clipped by the render layer
+        // (item 6). Subview order alone does not guarantee this because the renderer
+        // sublayer is composited at the layer level; the zoom overlay uses the same
+        // `zPosition` lever. The toolbar must also not clip its own bounds so the lift
+        // is visible above the strip.
+        toolbar.layer.zPosition = Self.bottomChromeZPosition
+        toolbar.clipsToBounds = false
+        installScrollToBottomButton()
         updateDockedToolbarVisibility()
         layoutBottomDock()
     }
 
-    /// Whether the IN-SURFACE docked accessory bar should be on screen right now:
-    /// while the software keyboard is up. The bar is keyboard-tied (it hides when the
-    /// keyboard is down). It stays visible while the composer is open: the surface now
-    /// owns the whole bottom dock (terminal / composer band / toolbar / keyboard) in
-    /// one coordinate system, so the toolbar is never reparented out and the composer
-    /// band is reserved separately ABOVE it. There is exactly one toolbar instance and
-    /// it never leaves the surface, so its buttons cannot disappear when the composer
-    /// opens.
-    private var dockedToolbarShouldBeVisible: Bool {
-        keyboardHeight > 0
+    /// Install the floating jump-to-bottom button as a sibling of the docked
+    /// toolbar. It shares the bottom-chrome `zPosition` so the lifted glass is
+    /// not clipped by the Ghostty render sublayer (item 6), and starts hidden
+    /// until ``setScrolledUp(_:)`` reports the viewport is scrolled up. Tapping
+    /// it routes to the surface delegate, which asks the Mac to scroll to bottom.
+    private func installScrollToBottomButton() {
+        guard scrollToBottomButton == nil else { return }
+        let button = ScrollToBottomButton()
+        button.layer.zPosition = Self.bottomChromeZPosition
+        button.alpha = 0
+        button.isHidden = true
+        button.onTap = { [weak self] in
+            guard let self else { return }
+            self.delegate?.ghosttySurfaceViewDidRequestScrollToBottom(self)
+        }
+        addSubview(button)
+        scrollToBottomButton = button
     }
 
-    /// Bottom space (points) the keyboard occupies *within this surface's bounds*.
-    /// The surface opts out of SwiftUI keyboard avoidance
-    /// (`.ignoresSafeArea(.keyboard)`), so its bounds always extend under the
-    /// keyboard and this is simply the live keyboard height — unconditionally, even
-    /// while composing. The composer band sits ABOVE the keyboard inside these same
-    /// bounds and is accounted for separately (``composerBandHeight``); it never
-    /// removes the keyboard region from the surface, so there is no double-count to
-    /// special-case. Used by ``bottomDockFrames()`` and the grid reservation.
+    /// Update whether the terminal is scrolled up and animate the floating
+    /// jump-to-bottom button in or out to match.
+    ///
+    /// Driven by the render-grid producer's authoritative viewport position
+    /// (pushed down from the shell store through the representable). Idempotent:
+    /// an unchanged value is a no-op so the steady stream of at-bottom frames
+    /// does not thrash the button. Hiding the bottom chrome (HIDE button) also
+    /// suppresses the floating button via ``layoutBottomDock``.
+    public func setScrolledUp(_ value: Bool) {
+        guard scrolledUp != value else { return }
+        scrolledUp = value
+        layoutBottomDock()
+        updateScrollToBottomButtonVisibility(animated: true)
+    }
+
+    /// Whether the floating jump-to-bottom button should currently be on screen:
+    /// the terminal is scrolled up AND the bottom chrome is not suppressed.
+    private var scrollToBottomButtonShouldBeVisible: Bool {
+        scrolledUp && !chromeHidden
+    }
+
+    /// Reconcile the floating button's visibility with the scrolled-up + chrome
+    /// state, optionally on the keyboard animation curve.
+    private func updateScrollToBottomButtonVisibility(animated: Bool) {
+        guard let button = scrollToBottomButton else { return }
+        let shouldShow = scrollToBottomButtonShouldBeVisible
+        let targetAlpha: CGFloat = shouldShow ? 1 : 0
+        guard button.alpha != targetAlpha || button.isHidden == shouldShow else { return }
+        if shouldShow { button.isHidden = false }
+        let apply = {
+            button.alpha = targetAlpha
+        }
+        let finish: (Bool) -> Void = { _ in
+            if !shouldShow { button.isHidden = true }
+        }
+        if animated {
+            UIView.animate(withDuration: 0.2, delay: 0, options: [.curveEaseInOut], animations: apply, completion: finish)
+        } else {
+            apply()
+            finish(true)
+        }
+    }
+
+    /// Layer `zPosition` for the bottom chrome (toolbar + composer band), placing it
+    /// above the Ghostty renderer's sublayer so a lifted Liquid-Glass button is not
+    /// clipped by the terminal render bounds (item 6). Below the zoom HUD (1100).
+    private static let bottomChromeZPosition: CGFloat = 1000
+
+    /// Whether the always-visible bottom chrome (the docked accessory toolbar and,
+    /// when open, the composer band) is currently on screen.
+    ///
+    /// Round 8 makes the toolbar ALWAYS visible — terminal mode, composer mode,
+    /// keyboard up AND down — so the only thing that hides it is the explicit HIDE
+    /// button (``chromeHidden``). The toolbar is no longer keyboard-tied. When the
+    /// keyboard is down the toolbar (and any open composer) ride above the bottom
+    /// safe area instead of disappearing; see ``bottomChromeInset``.
+    private var dockedToolbarShouldBeVisible: Bool {
+        !chromeHidden
+    }
+
+    /// True while the HIDE button has temporarily suppressed the bottom chrome
+    /// (toolbar + composer band). The chrome reappears on the next tap of the
+    /// terminal (``handleTap``). `isComposerPresented` is unchanged while hidden, so
+    /// the composer (and its draft) reappear intact. Item 2 of the Round 8 spec.
+    private var chromeHidden = false
+
+    /// Bottom space (points) reserved below the toolbar for the keyboard OR the home
+    /// indicator, whichever applies.
+    ///
+    /// When the software keyboard is up the toolbar rides its top, so this is the
+    /// live keyboard height. When the keyboard is down the toolbar is still visible
+    /// (Round 8), so it must clear the bottom safe area (home indicator) rather than
+    /// sit flush on the screen edge — this returns ``safeAreaInsetsBottom`` then. The
+    /// composer band and toolbar stack ABOVE this inset; the grid reserves it too.
+    /// Used by ``bottomDockFrames()`` and the grid reservation.
     private var keyboardOccupancyInBounds: CGFloat {
-        max(0, keyboardHeight)
+        keyboardHeight > 0 ? keyboardHeight : safeAreaInsetsBottom
+    }
+
+    /// The bottom safe-area inset (home-indicator height) in this surface's bounds.
+    ///
+    /// The surface extends under the bottom safe area (the host applies
+    /// `ignoresSafeArea(.container, .bottom)`), so when the keyboard is down the
+    /// always-visible toolbar must clear this much to avoid the home indicator. Reads
+    /// the view's own inset, falling back to the window's, because `safeAreaInsets`
+    /// can be zero before the view is on a window.
+    private var safeAreaInsetsBottom: CGFloat {
+        let own = safeAreaInsets.bottom
+        if own > 0 { return own }
+        return window?.safeAreaInsets.bottom ?? 0
     }
 
     /// Reconcile the docked bar's visibility (and its reserved grid height) with
@@ -1407,9 +1594,54 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         let reserved: CGFloat = shouldShow ? Self.persistentToolbarHeight : 0
         guard dockedToolbar?.isHidden != !shouldShow || reservedToolbarHeight != reserved else { return }
         dockedToolbar?.isHidden = !shouldShow
+        // The composer band rides with the toolbar: hide it when the chrome is
+        // suppressed, show it again when the chrome returns and a field is mounted.
+        // Its frame already collapses to `.zero` while hidden (see
+        // ``bottomDockFrames()``); toggling `isHidden` also stops it intercepting taps.
+        composerContainer.isHidden = !shouldShow || composerContainer.subviews.isEmpty
         reservedToolbarHeight = reserved
         setNeedsGeometrySync()
         setNeedsLayout()
+    }
+
+    /// Temporarily hide (or re-show) the bottom chrome — the always-visible toolbar
+    /// and any open composer band — via the HIDE button (item 2).
+    ///
+    /// Hiding also drops the software keyboard: with the toolbar always visible, HIDE
+    /// only makes sense as "clear all chrome to see the full terminal", which requires
+    /// resigning the keyboard too. `isComposerPresented` is left untouched, so the
+    /// composer (and its draft) reappear intact on the next terminal tap
+    /// (``handleTap``). Animated on the keyboard curve via ``animateBottomDock``.
+    private func setChromeHidden(_ hidden: Bool) {
+        guard chromeHidden != hidden else { return }
+        chromeHidden = hidden
+        if hidden, keyboardHeight > 0 {
+            // Drop the keyboard first; its hide notification re-seats the dock, then
+            // the visibility update below removes the toolbar/composer.
+            if composerActive {
+                composerContainer.endEditing(true)
+            } else {
+                resignInput()
+            }
+        }
+        updateDockedToolbarVisibility()
+        if hidden {
+            // Hide: animate the dock collapsing down into the bottom edge. (The toolbar
+            // is set `isHidden` only after this animation by `updateDockedToolbarVisibility`
+            // — actually `isHidden` is set synchronously, so this animate-out is largely
+            // invisible, but it keeps the frame coherent for the next show.)
+            animateBottomDock()
+        } else {
+            // Show: snap real frames into place with the bar visible, then let the
+            // ``handleTap``-driven `focusInput()` → keyboard-show animation carry the
+            // motion. Animating here from the collapsed bottom-edge strip would
+            // double-animate against the keyboard rise.
+            layoutBottomDock()
+        }
+        // The floating jump-to-bottom button rides with the chrome: HIDE suppresses
+        // it, and a re-show restores it if the terminal is still scrolled up.
+        updateScrollToBottomButtonVisibility(animated: true)
+        setNeedsGeometrySync()
     }
 
     /// Track whether the composer is open and keep the keyboard up across the
@@ -1427,19 +1659,18 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     ///   first tore the keyboard down and the composer re-summoned it (a flicker).
     /// - Closing (`active == false`): two distinct intents share this path, told
     ///   apart by ``keyboardHeight``:
-    ///   - Toggle-close (the chevron tapped while typing): `keyboardHeight > 0`. The
-    ///     user wants to keep the keyboard. The composer's field resigns first
-    ///     responder as it is torn out, with nothing to take it back, so re-take it on
-    ///     the terminal input proxy in the same update — some responder is always first
-    ///     responder at runloop end and the keyboard hands back in place instead of
+    ///   - Chevron-close while typing: `keyboardHeight > 0`. The user wants to keep the
+    ///     keyboard (a genuine return to the terminal). The composer's field resigns
+    ///     first responder as it is torn out, with nothing to take it back, so re-take it
+    ///     on the terminal input proxy in the same update — some responder is always
+    ///     first responder at runloop end and the keyboard hands back in place instead of
     ///     dropping.
-    ///   - Collapse-close (the keyboard already went down — swipe, hardware keyboard,
-    ///     backgrounding, or the hide-keyboard button — which routes through
-    ///     ``ghosttySurfaceViewDidCollapseKeyboard(_:)`` → `dismissComposer`):
-    ///     `keyboardHeight == 0`. The user wants the keyboard DOWN, so do NOT re-focus
-    ///     the proxy; that would re-summon the keyboard and defeat
-    ///     `composerPresented ⇒ keyboardUp`. Gating the re-focus on `keyboardHeight > 0`
-    ///     is what makes that invariant hold in BOTH directions.
+    ///   - Chevron-close while the keyboard is already down: `keyboardHeight == 0` (a
+    ///     legal Round 8 state — the composer survives a keyboard-down). Do NOT re-focus
+    ///     the proxy; that would re-summon the keyboard the user already dismissed. The
+    ///     toolbar stays visible regardless, so closing the composer just collapses its
+    ///     band. Gating the re-focus on `keyboardHeight > 0` makes both directions
+    ///     correct.
     ///   No sleep / `asyncAfter`: the `become` is issued synchronously here.
     public func setComposerActive(_ active: Bool) {
         guard composerActive != active else { return }
@@ -1453,14 +1684,14 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
             // height arrives separately via `setComposerBandHeight(_:animated:)` once
             // the host mounts and measures the field.
         } else {
-            // Closing: re-take first responder on the terminal input proxy ONLY for a
-            // toggle-close (keyboard still up, `keyboardHeight > 0`) so the keyboard
-            // hands back in place instead of dropping. For a collapse-close (keyboard
-            // already down) re-focusing would re-summon the keyboard, so skip it — that
-            // is the structural enforcement of `composerPresented ⇒ keyboardUp`. The
-            // host animates the band height back to 0 on unmount, so the band shrink
-            // reads as one motion; do NOT snap it to 0 here or that pre-empts the
-            // animation.
+            // Closing: re-take first responder on the terminal input proxy ONLY when the
+            // keyboard is still up (`keyboardHeight > 0`, a chevron-close while typing) so
+            // the keyboard hands back in place instead of dropping. When the keyboard is
+            // already down (a legal Round 8 state — the composer survived a keyboard-down)
+            // re-focusing would re-summon the keyboard the user dismissed, so skip it. The
+            // host animates the band height back to 0 (with the field still mounted, item
+            // 3), so the band shrink reads as one motion; do NOT snap it to 0 here or that
+            // pre-empts the animation.
             if keyboardHeight > 0, window != nil, !isDismantled, !inputProxy.isFirstResponder {
                 Self.activeInputSurface = self
                 inputProxy.updateAccessoryLayoutInsets()
@@ -1500,6 +1731,57 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         #endif
     }
 
+    /// Whether the composer's hosted field currently holds first responder.
+    ///
+    /// The composer field is a SwiftUI `TextField` deep inside a `UIHostingController`
+    /// mounted under ``composerContainer``, so `composerContainer.isFirstResponder` is
+    /// always false (the container is not the responder, the nested field is). A
+    /// recursive subtree walk (``UIView/firstResponderInSubtree()``) finds the actual
+    /// first responder; it is the composer field iff that responder lives under the
+    /// container. Drives the compose-button open/close-vs-refocus decision; false when
+    /// the band is empty (no field mounted).
+    private var composerFieldIsFirstResponder: Bool {
+        guard !composerContainer.subviews.isEmpty else { return false }
+        return composerContainer.firstResponderInSubtree() != nil
+    }
+
+    /// Resolve the current bottom-dock state and act on a compose-button tap so the
+    /// draft is never lost across the compose → hide → reveal → compose cycle.
+    ///
+    /// The decision is the pure ``ComposerDockState/intentForComposeButtonTap()``
+    /// reducer (unit-tested off-device); this method only reads the four live dock
+    /// bits and maps the resulting ``ComposerDockIntent`` onto UIKit/delegate calls:
+    ///
+    /// - ``ComposerDockIntent/openComposer`` / ``ComposerDockIntent/closeComposer``:
+    ///   forward the genuine toggle (open from nothing, or close a visible+focused
+    ///   composer) to the host's `toggleComposer`.
+    /// - ``ComposerDockIntent/revealAndFocusComposer``: the composer is presented but
+    ///   suppressed by HIDE, or visible-yet-unfocused after a reveal. Bring the chrome
+    ///   back if hidden, then ask the host to ensure-present + re-focus the field. The
+    ///   presented flag is never toggled off, so the draft and band return intact —
+    ///   this is the fix for the blind toggle that dismissed a still-presented composer.
+    private func handleComposerButtonTap() {
+        let dockState = ComposerDockState(
+            chromeHidden: chromeHidden,
+            composerPresented: composerActive,
+            fieldFocused: composerFieldIsFirstResponder,
+            keyboardUp: keyboardHeight > 0
+        )
+        let intent = dockState.intentForComposeButtonTap()
+        #if DEBUG
+        lastComposerDockIntent = intent
+        #endif
+        switch intent {
+        case .openComposer, .closeComposer:
+            delegate?.ghosttySurfaceViewDidRequestComposerToggle(self)
+        case .revealAndFocusComposer:
+            if chromeHidden {
+                setChromeHidden(false)
+            }
+            delegate?.ghosttySurfaceViewDidRequestComposerFocus(self)
+        }
+    }
+
     /// Install the composer band container into the surface's view hierarchy, above
     /// the docked toolbar. Hidden and zero-height until the host mounts a compose
     /// field into it (``mountComposerView(_:)``); the surface positions it in
@@ -1509,8 +1791,12 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     private func installComposerContainer() {
         composerContainer.backgroundColor = .clear
         composerContainer.isHidden = true
-        composerContainer.clipsToBounds = true
-        // Above the toolbar in z-order so any Liquid-Glass shadow reads correctly.
+        // Do NOT clip: the composer's Liquid-Glass controls lift/shadow past the band
+        // edge, and the band must sit above the Ghostty render layer (item 6) so the
+        // glass is not clipped by the terminal bounds. Raised to the same chrome
+        // z-position as the toolbar.
+        composerContainer.clipsToBounds = false
+        composerContainer.layer.zPosition = Self.bottomChromeZPosition
         addSubview(composerContainer)
         layoutBottomDock()
     }
@@ -1543,22 +1829,31 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         composerContainer.isHidden = false
     }
 
-    /// Set the height (points) the open composer band reserves above the docked
+    /// Set the height (points) the open composer band reserves below the docked
     /// toolbar, from the hosted compose field's intrinsic content size. Drives the
     /// grid reservation (so a field-grow pushes only the terminal up) and the dock
     /// layout. When `animated`, the reservation + reflow run inside a `UIView.animate`
-    /// using the keyboard's curve/duration so the height change reads as one smooth
-    /// motion with the rest of the dock (requirement 4). Idempotent: a no-op when the
-    /// height is unchanged.
+    /// using the keyboard curve so the height change reads as one smooth motion with
+    /// the rest of the dock (item 3/4). Idempotent: a no-op when the height is
+    /// unchanged (then `completion` runs immediately so an unmount-on-close never
+    /// strands the mounted field).
     ///
     /// - Parameters:
     ///   - height: The compose field's measured height, clamped to non-negative.
     ///   - animated: Whether to animate the reflow (true for a live grow/shrink as the
-    ///     user types; false for the initial mount, where the open transition already
-    ///     animates).
-    public func setComposerBandHeight(_ height: CGFloat, animated: Bool) {
+    ///     user types and for the symmetric close; false for the initial mount, where
+    ///     the open transition already animates).
+    ///   - completion: Run after the reflow lands. The close path passes the field
+    ///     unmount here so the band animates to 0 with the field STILL mounted (item 3:
+    ///     a symmetric, coordinated close), and the field is removed only once the band
+    ///     has collapsed — reversing the round-7 order that unmounted first and left the
+    ///     band collapsing over empty space (the janky close).
+    public func setComposerBandHeight(_ height: CGFloat, animated: Bool, completion: (() -> Void)? = nil) {
         let clamped = max(0, height)
-        guard abs(clamped - composerBandHeight) > 0.5 else { return }
+        guard abs(clamped - composerBandHeight) > 0.5 else {
+            completion?()
+            return
+        }
         composerBandHeight = clamped
         let apply = { [weak self] in
             guard let self else { return }
@@ -1570,10 +1865,12 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
                 withDuration: Self.composerReflowDuration,
                 delay: 0,
                 options: [.curveEaseInOut, .beginFromCurrentState],
-                animations: apply
+                animations: apply,
+                completion: { _ in completion?() }
             )
         } else {
             apply()
+            completion?()
         }
         setNeedsGeometrySync()
     }
@@ -1588,50 +1885,65 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// docked toolbar, and the keyboard top stack consistently in the surface's single
     /// coordinate system.
     ///
-    /// From the bottom up: the keyboard occupies `keyboardOccupancyInBounds` at the
-    /// surface bottom; the toolbar button band sits directly above the keyboard top;
-    /// the composer band (when open) sits directly above the toolbar; the terminal grid
-    /// fills the rest. The toolbar does NOT reserve the bottom safe area — it IS the
-    /// bottom chrome, so the home indicator overlays its lower edge like a system tab
-    /// bar.
+    /// Round 8 stack, from the BOTTOM up: the keyboard (or, keyboard-down, the bottom
+    /// safe area) occupies `keyboardOccupancyInBounds` at the surface bottom; the
+    /// composer band (when open) sits directly above that; the toolbar button band
+    /// sits directly above the composer; the terminal grid fills the rest. So the
+    /// visual order top→bottom is `terminal / toolbar / composer / keyboard` (item 1).
+    /// This is the inverse of Round 7 (toolbar-on-keyboard, composer-above-toolbar):
+    /// the composer is now the chrome closest to the keyboard, with the always-visible
+    /// toolbar above it.
     ///
     /// The toolbar's button row is bottom-pinned inside its container (see
     /// `TerminalInputTextView.dockedButtonRowHeight`), so the controls always hug the
-    /// keyboard top no matter how tall the container is — this is the round-6 fix for
-    /// "toolbar rides up off the keyboard on a letterbox/resize", and it is KEPT here
-    /// for free because the toolbar never leaves the surface. When there is no composer
-    /// band, the toolbar's TOP floats up to the rendered terminal's bottom
-    /// (`lastRenderRect.maxY`) to absorb the sub-cell remainder (no terminal-background
-    /// gap above the bar). When the composer band is open, the band sits flush on the
-    /// toolbar's reserved top and absorbs that slack instead.
+    /// band's bottom no matter how tall the container is — the round-6 fix for "toolbar
+    /// rides up off the keyboard on a letterbox/resize", kept for free because the
+    /// toolbar never leaves the surface. When there is no composer band, the toolbar's
+    /// TOP floats up to the rendered terminal's bottom (`lastRenderRect.maxY`) to
+    /// absorb the sub-cell remainder (no terminal-background gap above the bar). When
+    /// the composer band is open, the toolbar is exactly its button band and the
+    /// composer below absorbs the layout.
+    ///
+    /// While the HIDE button has suppressed the chrome (``chromeHidden``) the dock is
+    /// off screen (both frames `.zero`); the grid reservation matches (it reserves 0),
+    /// so the terminal reclaims the whole height.
     private func bottomDockFrames() -> (composer: CGRect, toolbar: CGRect) {
         let occupied = keyboardOccupancyInBounds
-        let bottomEdge = bounds.height - occupied
+        // While the HIDE button has suppressed the chrome, collapse the dock to a
+        // zero-height strip pinned at the bottom edge (NOT `CGRect.zero` at the origin,
+        // which would make the next show animate the bar growing out of the top-left
+        // corner). The toolbar is also `isHidden`, so this is purely about leaving a
+        // sane frame to animate from/to.
+        let bottomEdge = chromeHidden ? bounds.height : bounds.height - occupied
         let width = bounds.width
-        // The toolbar's button band always occupies exactly `persistentToolbarHeight`
-        // directly above the keyboard top; the composer band reserves
-        // `composerBandHeight` above that.
-        let toolbarReservedTop = bottomEdge - Self.persistentToolbarHeight
-        let composerBottom = toolbarReservedTop
-        let composerTop = composerBottom - composerBandHeight
-        let composerFrame = composerBandHeight > 0
-            ? CGRect(x: 0, y: max(0, composerTop), width: width, height: composerBandHeight)
-            : .zero
-        // Toolbar top: with a composer band the band already covers the slack down to
-        // `toolbarReservedTop`, so the toolbar container is exactly its button band.
-        // Without one, let the top float up to the rendered terminal's bottom so the
+        let effectiveComposerHeight = chromeHidden ? 0 : composerBandHeight
+        // Composer band sits directly above the keyboard (or the safe-area inset),
+        // pinned to the bottom edge; the toolbar's button band reserves
+        // `persistentToolbarHeight` directly above the composer. At height 0 the band
+        // frame is a zero-height strip AT `bottomEdge` (composerTop == bottomEdge), so a
+        // close animates a smooth downward height-collapse into the toolbar/keyboard
+        // edge rather than flying to the origin (item 3).
+        let composerTop = bottomEdge - effectiveComposerHeight
+        let composerFrame = CGRect(x: 0, y: max(0, composerTop), width: width, height: effectiveComposerHeight)
+        // Toolbar's reserved bottom is the composer's top (or the bottom edge with no
+        // composer), and its reserved top is one button-row band above that.
+        let toolbarBottom = effectiveComposerHeight > 0 ? composerTop : bottomEdge
+        let toolbarReservedTop = toolbarBottom - Self.persistentToolbarHeight
+        // Toolbar top: with a composer band below, the toolbar container is exactly its
+        // button band (no slack to absorb — the composer owns the space below). Without
+        // a composer, let the top float up to the rendered terminal's bottom so the
         // container's background fills the sub-cell remainder (libghostty floors the
         // grid to whole cells and top-anchors the render, so `lastRenderRect.maxY` is at
         // or above `toolbarReservedTop`). Never drop below `toolbarReservedTop` (that
         // would re-open the gap) and never go negative.
         let toolbarTop: CGFloat
-        if composerBandHeight > 0 {
+        if effectiveComposerHeight > 0 {
             toolbarTop = max(0, toolbarReservedTop)
         } else {
             let renderBottom = lastRenderRect.isEmpty ? toolbarReservedTop : lastRenderRect.maxY
             toolbarTop = max(0, min(renderBottom, toolbarReservedTop))
         }
-        let toolbarFrame = CGRect(x: 0, y: toolbarTop, width: width, height: bottomEdge - toolbarTop)
+        let toolbarFrame = CGRect(x: 0, y: toolbarTop, width: width, height: toolbarBottom - toolbarTop)
         return (composerFrame, toolbarFrame)
     }
 
@@ -1642,6 +1954,29 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         let frames = bottomDockFrames()
         composerContainer.frame = frames.composer
         dockedToolbar?.frame = frames.toolbar
+        layoutScrollToBottomButton(aboveDockTop: frames.toolbar.minY)
+    }
+
+    /// Spacing (points) between the floating jump-to-bottom button and the dock
+    /// above which it floats, and the trailing edge.
+    private static let scrollToBottomButtonMargin: CGFloat = 12
+
+    /// Pin the floating jump-to-bottom button to the bottom-right, floating just
+    /// above the bottom dock (the toolbar top, which already rides above the
+    /// composer band, keyboard, and home-indicator reserve). Reuses the dock's
+    /// own computed top edge so the button tracks the toolbar/composer/keyboard
+    /// as they show and hide instead of a hardcoded offset.
+    private func layoutScrollToBottomButton(aboveDockTop dockTop: CGFloat) {
+        guard let button = scrollToBottomButton else { return }
+        let size = ScrollToBottomButton.diameter
+        let margin = Self.scrollToBottomButtonMargin
+        // When the chrome is suppressed the dock collapses to the bottom edge;
+        // float the button above the bottom safe area instead so HIDE does not
+        // shove it under the home indicator (it is hidden in that state anyway).
+        let referenceTop = chromeHidden ? bounds.height - safeAreaInsetsBottom : dockTop
+        let x = bounds.width - size - margin
+        let y = referenceTop - size - margin
+        button.frame = CGRect(x: x, y: max(0, y), width: size, height: size)
     }
 
     /// Animate the whole bottom dock (composer band + toolbar) in lockstep with a
@@ -1649,14 +1984,27 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// interactive (swipe-down) dismissal in this terminal, so a notification-driven
     /// animate is sufficient and avoids the `keyboardLayoutGuide` safe-area mismatch.
     private func animateDockedToolbar(with notification: Notification) {
-        let frames = bottomDockFrames()
         let duration = (notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double) ?? 0.25
         let curveRaw = (notification.userInfo?[UIResponder.keyboardAnimationCurveUserInfoKey] as? Int)
             ?? Int(UIView.AnimationCurve.easeInOut.rawValue)
+        animateBottomDock(duration: duration, curveOption: UIView.AnimationOptions(rawValue: UInt(curveRaw) << 16))
+    }
+
+    /// Animate the whole bottom dock (composer band + toolbar) to its current target
+    /// frames over the given duration/curve. Used by ``animateDockedToolbar(with:)``
+    /// (keyboard show/hide, with the notification's own curve) and by the HIDE/show and
+    /// composer close paths (item 3), which have no keyboard notification and so default
+    /// to the system keyboard duration + easeInOut so the motion still reads as one
+    /// smooth coordinated reflow.
+    private func animateBottomDock(
+        duration: TimeInterval = 0.25,
+        curveOption: UIView.AnimationOptions = .curveEaseInOut
+    ) {
+        let frames = bottomDockFrames()
         UIView.animate(
             withDuration: duration,
             delay: 0,
-            options: UIView.AnimationOptions(rawValue: UInt(curveRaw) << 16)
+            options: [curveOption, .beginFromCurrentState]
         ) { [weak self] in
             self?.composerContainer.frame = frames.composer
             self?.dockedToolbar?.frame = frames.toolbar
@@ -1726,9 +2074,28 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// treats it as a harmless empty selection, so tapping a shell still just
     /// focuses input.
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
+        // A tap re-reveals chrome the HIDE button suppressed (item 2). Done before
+        // forwarding the tap/focus so the toolbar (and any open composer) animate back
+        // in as the keyboard comes up. Capture the pre-reveal state: a reveal that
+        // brings back a still-presented composer must restore focus to the COMPOSER
+        // field, not the terminal proxy — otherwise the next compose-button tap reads
+        // "presented but unfocused" and the prior round dismissed it, losing the draft.
+        let wasHidden = chromeHidden
+        if chromeHidden {
+            setChromeHidden(false)
+        }
         let cell = scrollCell(at: gesture.location(in: self))
         delegate?.ghosttySurfaceView(self, didTapAtCol: cell.col, row: cell.row)
-        focusInput()
+        // A tap inside the composer band is excluded by the gesture recognizer
+        // (`gestureRecognizer(_:shouldReceive:)`), so any tap reaching here is a
+        // deliberate terminal tap. Only a reveal-from-hide with the composer still
+        // presented re-focuses the composer; every other terminal tap focuses the
+        // terminal proxy as before.
+        if wasHidden, composerActive {
+            delegate?.ghosttySurfaceViewDidRequestComposerFocus(self)
+        } else {
+            focusInput()
+        }
     }
 
     @objc private func handlePinch(_ gesture: UIPinchGestureRecognizer) {
@@ -1940,6 +2307,10 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         snapshotFallbackView.frame = bounds
         #if DEBUG
         debugAccessibilityProxy.frame = bounds
+        // The dock probe stays a 1×1 off-screen carrier; its accessibility value is
+        // computed live on every read (see ``composerDockProbeValue``), so it never
+        // needs a frame-driven refresh.
+        composerDockProbe.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
         #endif
         inputProxy.frame = CGRect(x: 0, y: 0, width: bounds.width, height: 1)
         inputProxy.updateAccessoryLayoutInsets()
@@ -1948,6 +2319,17 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         MobileDebugLog.anchormux("surface.layout bounds=\(Int(bounds.width))x\(Int(bounds.height)) window=\(window != nil)")
         setNeedsGeometrySync()
         syncSurfaceVisibility()
+    }
+
+    public override func safeAreaInsetsDidChange() {
+        super.safeAreaInsetsDidChange()
+        // The always-visible toolbar rides the bottom safe area while the keyboard
+        // is down (Round 8). The inset can arrive after the first layout (it is 0
+        // before window attach), so re-seat the dock and re-reserve the grid when it
+        // changes; otherwise the toolbar would sit on the home indicator until the
+        // next unrelated relayout.
+        layoutBottomDock()
+        setNeedsGeometrySync()
     }
 
     public override func didMoveToWindow() {
@@ -2044,7 +2426,24 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
                     self.updateCursorOverlay()
                 }
                 #if DEBUG
-                self.lastOutputAppliedTime = CACurrentMediaTime()
+                // RENDER: frame-apply heartbeat. Time-gated to ≈1/s so it is a
+                // heartbeat, not a per-chunk flood, on the lock-free diagnostic sink.
+                // `ms` = gap since the previous applied chunk; `a` = this chunk's byte
+                // length. A growing gap or this event ceasing while input still works
+                // localizes a stalled render-grid consumer.
+                let applyNow = CACurrentMediaTime()
+                if applyNow - self.lastRenderFrameDiagTime >= 1.0 {
+                    let gapMs = self.lastOutputAppliedTime > 0
+                        ? UInt32(min(Double(UInt32.max), max(0, (applyNow - self.lastOutputAppliedTime) * 1000)))
+                        : 0
+                    self.diagnosticLog?.record(DiagnosticEvent(
+                        .renderFrameApplied,
+                        ms: gapMs,
+                        a: forwarded.count
+                    ))
+                    self.lastRenderFrameDiagTime = applyNow
+                }
+                self.lastOutputAppliedTime = applyNow
                 #endif
                 if !self.surfaceHasReceivedOutput {
                     self.surfaceHasReceivedOutput = true
@@ -2506,19 +2905,64 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         // (Called on main from the display link.)
         if renderInFlight {
             needsAnotherRender = true
+            #if DEBUG
+            // RENDER: render busy / snapshot skipped. A render is already in flight, so
+            // this frame's render is coalesced away. Time-gated to ≈1/s; `a` = how long
+            // the in-flight render has been running so far (ms). A long, climbing value
+            // with a frozen screen is the wedged-render-queue signal while input still
+            // works.
+            let busyNow = CACurrentMediaTime()
+            if busyNow - lastRenderBusyDiagTime >= 1.0 {
+                lastRenderBusyDiagTime = busyNow
+                let inFlightMs = renderInFlightStart > 0
+                    ? UInt32(min(Double(UInt32.max), max(0, (busyNow - renderInFlightStart) * 1000)))
+                    : 0
+                diagnosticLog?.record(DiagnosticEvent(.renderBusySkipped, a: Int(inFlightMs)))
+            }
+            #endif
             return
         }
         renderInFlight = true
         let enqueuedAt = CACurrentMediaTime()
+        #if DEBUG
+        renderInFlightStart = enqueuedAt
+        #endif
         Self.outputQueue.async { [weak self] in
             // Queue LAG = how long this render waited behind other ops. If this
             // climbs into hundreds of ms the queue is backlogged (the freeze).
             let lagMs = (CACurrentMediaTime() - enqueuedAt) * 1000
-            if lagMs > 150 { MobileDebugLog.anchormux("oq.render.LAG \(Int(lagMs))ms") }
+            if lagMs > 150 {
+                MobileDebugLog.anchormux("oq.render.LAG \(Int(lagMs))ms")
+                #if DEBUG
+                // RENDER: the render queue lagged — this render waited a long time
+                // behind other ops before running. `ms` = the measured wait.
+                self?.diagnosticLog?.record(DiagnosticEvent(
+                    .renderGridLag,
+                    ms: UInt32(min(Double(UInt32.max), lagMs))
+                ))
+                #endif
+            }
             ghostty_surface_render_now(surface)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.renderInFlight = false
+                #if DEBUG
+                // RENDER: render-busy duration — enqueue → completion, in ms. Recorded
+                // ONLY for a slow render (> `renderCompletedSlowThresholdMs`); a normal
+                // few-ms render at 120fps would flood the bounded ring and evict every
+                // other event. A spike here with a frozen screen confirms `render_now`
+                // itself (GPU/swap-chain) stalled rather than the stream drying up.
+                let completedMs = self.renderInFlightStart > 0
+                    ? max(0, (CACurrentMediaTime() - self.renderInFlightStart) * 1000)
+                    : 0
+                if completedMs > Self.renderCompletedSlowThresholdMs {
+                    self.diagnosticLog?.record(DiagnosticEvent(
+                        .renderCompleted,
+                        ms: UInt32(min(Double(UInt32.max), completedMs))
+                    ))
+                }
+                self.renderInFlightStart = 0
+                #endif
                 guard !self.isDismantled else {
                     self.needsAnotherRender = false
                     return
@@ -2754,15 +3198,20 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         // The main thread only applies the UIKit result. This is the single
         // off-main surface owner: main never calls a blocking libghostty API.
         let scale = preferredScreenScale
-        // Reserve, from the bottom up, the keyboard (when up), the persistent toolbar,
-        // and the open composer band — the surface owns the whole bottom dock in one
-        // coordinate system, so the grid shrinks by all three. The toolbar sits flush
-        // above the keyboard and keeps the bottom TUI rows off the home indicator, so
-        // the grid does NOT also reserve the bottom safe area (that left an empty strip
-        // below the toolbar). The composer band reserves separately above the toolbar,
-        // so a field-grow shrinks ONLY the terminal grid; the toolbar and keyboard
-        // below it do not move.
-        let reservedBottom = composerBandHeight + reservedToolbarHeight + keyboardOccupancyInBounds
+        // Reserve, from the bottom up, the keyboard/safe-area inset
+        // (`keyboardOccupancyInBounds`: keyboard height when up, else the bottom safe
+        // area so the always-visible toolbar clears the home indicator), the open
+        // composer band, and the persistent toolbar — the surface owns the whole bottom
+        // dock in one coordinate system, so the grid shrinks by all three. The order is
+        // immaterial to the reserved total; only the frame positions in
+        // ``bottomDockFrames()`` encode the `terminal / toolbar / composer / keyboard`
+        // stack. While the HIDE button has suppressed the chrome (``chromeHidden``) the
+        // toolbar is off screen and reserves nothing, and the composer band is hidden,
+        // so the grid reclaims the whole height; reserve only the keyboard if it is
+        // somehow still up.
+        let reservedBottom = chromeHidden
+            ? keyboardOccupancyInBounds
+            : composerBandHeight + reservedToolbarHeight + keyboardOccupancyInBounds
         let bottomInset = min(reservedBottom, max(0, bounds.height - 1))
         let containerW = max(1, bounds.width)
         let containerH = max(1, bounds.height - bottomInset)
@@ -3511,5 +3960,22 @@ final class TerminalArrowNubView: UIView {
         repeatTask = nil
     }
 }
+
+#if DEBUG
+/// Off-screen accessibility carrier that reports ``GhosttySurfaceView``'s live
+/// bottom-dock state to UI tests. Computes ``accessibilityValue`` on every read
+/// (delegating to ``GhosttySurfaceView/composerDockProbeValue``) so an XCUITest
+/// predicate-wait converges on the SETTLED post-transition state even though
+/// `fieldFocused`/`proxyFirstResponder` flip a runloop after the synchronous
+/// transition. DEBUG-only; never compiled into a shipping build.
+final class ComposerDockProbeView: UIView {
+    weak var surface: GhosttySurfaceView?
+
+    override var accessibilityValue: String? {
+        get { surface?.composerDockProbeValue }
+        set { /* read-only live probe; ignore writes */ }
+    }
+}
+#endif
 
 #endif

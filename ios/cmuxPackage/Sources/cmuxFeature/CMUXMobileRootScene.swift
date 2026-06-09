@@ -3,6 +3,7 @@ import CmuxAuthRuntime
 import CmuxMobileAnalytics
 import CmuxMobilePairedMac
 import CmuxMobileShell
+import CmuxMobileShellModel
 @_exported import CmuxMobileShellUI
 import CmuxMobileTransport
 import Foundation
@@ -34,6 +35,10 @@ public struct CMUXMobileRootScene: View {
     #if os(iOS)
     private let pushCoordinator: MobilePushCoordinator
     private let displaySettings: MobileDisplaySettings
+    /// The first-run onboarding "seen" flag store, injected into the root view so
+    /// it gates the one-time onboarding screen ahead of the never-paired
+    /// add-device state.
+    private let onboardingStore: MobileOnboardingStore
     #endif
     private let pairedMacStore: (any MobilePairedMacStoring)?
     /// Persists per-terminal composer drafts to the app container so an unsent
@@ -60,6 +65,8 @@ public struct CMUXMobileRootScene: View {
     ///     delegate) injected into the environment.
     ///   - displaySettings: The app-root mobile display settings injected into
     ///     the environment (drives workspace-title wrapping).
+    ///   - onboardingStore: The app-root first-run onboarding "seen" flag store,
+    ///     injected into the root view to gate the one-time onboarding screen.
     ///   - diagnosticLog: The structured diagnostic log (DEBUG builds only),
     ///     injected into the shell store for the DEV feedback round-trip.
     public init(
@@ -69,6 +76,7 @@ public struct CMUXMobileRootScene: View {
         analytics: any AnalyticsEmitting,
         pushCoordinator: MobilePushCoordinator,
         displaySettings: MobileDisplaySettings,
+        onboardingStore: MobileOnboardingStore,
         diagnosticLog: DiagnosticLog? = nil
     ) {
         self.runtime = runtime
@@ -77,6 +85,7 @@ public struct CMUXMobileRootScene: View {
         self.analytics = analytics
         self.pushCoordinator = pushCoordinator
         self.displaySettings = displaySettings
+        self.onboardingStore = onboardingStore
         self.pairedMacStore = Self.openPairedMacStore()
         self.draftStore = Self.openDraftStore()
         #if DEBUG
@@ -125,6 +134,28 @@ public struct CMUXMobileRootScene: View {
         }
     }
 
+    /// Build the team-scoped device-registry client over the auth coordinator.
+    ///
+    /// Tokens and the target team are read live through the coordinator so the
+    /// registry call always uses the current session and selected team. The
+    /// service is failure-tolerant, so a missing API base URL or a registry
+    /// outage simply means reconnect falls back to local paired-Mac routes.
+    @MainActor
+    private func makeDeviceRegistry() -> DeviceRegistryService? {
+        let baseURL = auth.config.apiBaseURL
+        guard !baseURL.isEmpty else { return nil }
+        let coordinator = auth.coordinator
+        return DeviceRegistryService(
+            apiBaseURL: baseURL,
+            deviceID: DeviceRegistryService.deviceID(),
+            tokenSource: DeviceRegistryService.TokenSource(
+                accessToken: { try? await coordinator.accessToken() },
+                refreshToken: { await coordinator.refreshToken() }
+            ),
+            teamIDProvider: { await coordinator.resolvedTeamID }
+        )
+    }
+
     public var body: some View {
         content
             .environment(auth.coordinator)
@@ -137,12 +168,16 @@ public struct CMUXMobileRootScene: View {
 
     @ViewBuilder
     private var content: some View {
-        #if canImport(UIKit) && DEBUG
+        #if os(iOS)
+        #if DEBUG
         if ProcessInfo.processInfo.environment["CMUX_ZOOM_STRESS"] == "1" {
             MobileZoomStressView()
         } else {
-            CMUXMobileAppView(store: makeStore())
+            CMUXMobileAppView(store: makeStore(), onboardingStore: onboardingStore)
         }
+        #else
+        CMUXMobileAppView(store: makeStore(), onboardingStore: onboardingStore)
+        #endif
         #else
         CMUXMobileAppView(store: makeStore())
         #endif
@@ -151,24 +186,35 @@ public struct CMUXMobileRootScene: View {
     @MainActor
     private func makeStore() -> CMUXMobileShellStore {
         let identityProvider = AuthCoordinatorIdentityProvider(coordinator: auth.coordinator)
+        let deviceRegistry = makeDeviceRegistry()
+        let feedbackEmailSubmitter = MobileFeedbackEmailClient(apiBaseURL: auth.config.apiBaseURL)
+        let feedbackStampProvider: @MainActor () -> MobileFeedbackStamp = {
+            MobileFeedbackStampFactory.current()
+        }
         #if DEBUG
         return CMUXMobileShellStore(
             runtime: runtime,
             pairedMacStore: pairedMacStore,
+            deviceRegistry: deviceRegistry,
             identityProvider: identityProvider,
             reachability: reachability,
             analytics: analytics,
             diagnosticLog: diagnosticLog,
-            draftStore: draftStore
+            draftStore: draftStore,
+            feedbackEmailSubmitter: feedbackEmailSubmitter,
+            feedbackStampProvider: feedbackStampProvider
         )
         #else
         return CMUXMobileShellStore(
             runtime: runtime,
             pairedMacStore: pairedMacStore,
+            deviceRegistry: deviceRegistry,
             identityProvider: identityProvider,
             reachability: reachability,
             analytics: analytics,
-            draftStore: draftStore
+            draftStore: draftStore,
+            feedbackEmailSubmitter: feedbackEmailSubmitter,
+            feedbackStampProvider: feedbackStampProvider
         )
         #endif
     }

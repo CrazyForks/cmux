@@ -23,8 +23,8 @@ final class DogfoodFeedbackUISubmitter: DogfoodFeedbackSubmitting {
     private let store: CMUXMobileShellStore
 
     /// Creates the submitter.
-    /// - Parameter store: The shell store whose `submitDogfoodFeedback` carries
-    ///   the bundle to the paired Mac.
+    /// - Parameter store: The shell store whose `submitPrivilegedAgentFeedback`
+    ///   carries the bundle to the paired Mac.
     init(store: CMUXMobileShellStore) {
         self.store = store
     }
@@ -37,7 +37,7 @@ final class DogfoodFeedbackUISubmitter: DogfoodFeedbackSubmitting {
         let terminalText = GhosttySurfaceView.visibleTerminalSnapshot()
         let (_, debugLogText) = await MobileDebugLog.shared.sink.snapshotWithCount()
         let answersJSON = try? answers.encode()
-        return await store.submitDogfoodFeedback(
+        return await store.submitPrivilegedAgentFeedback(
             text: answers.note,
             debugLogText: debugLogText,
             terminalText: terminalText,
