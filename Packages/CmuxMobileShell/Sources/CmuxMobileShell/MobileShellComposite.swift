@@ -3700,15 +3700,12 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                 supportsWorkspaceActions = false
                 supportsTerminalPaste = false
                 supportsDogfoodFeedback = false
+                supportsWorkspaceGroups = false
                 return fallback
             }
             supportsWorkspaceActions = payload.capabilities.contains(Self.workspaceActionsCapability)
             supportsTerminalPaste = payload.capabilities.contains(Self.terminalPasteCapability)
             supportsDogfoodFeedback = payload.capabilities.contains(Self.dogfoodFeedbackCapability)
-                supportsWorkspaceGroups = false
-                return fallback
-            }
-            supportsWorkspaceActions = payload.capabilities.contains(Self.workspaceActionsCapability)
             supportsWorkspaceGroups = payload.capabilities.contains(Self.workspaceGroupsCapability)
             let transport: TerminalOutputTransport = payload.capabilities.contains(Self.terminalRenderGridCapability) ||
                 payload.terminalFidelity == "render_grid" ? .renderGrid : .rawBytes

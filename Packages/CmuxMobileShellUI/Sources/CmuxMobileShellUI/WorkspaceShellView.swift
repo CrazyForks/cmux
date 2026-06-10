@@ -244,6 +244,7 @@ struct WorkspaceShellView: View {
         #else
         return nil
         #endif
+    }
 
     /// Group collapse/expand closure. Present when the Mac advertises
     /// `workspace.groups.v1` or has actually emitted group sections: a Mac that
