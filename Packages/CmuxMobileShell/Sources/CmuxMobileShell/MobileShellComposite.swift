@@ -290,12 +290,23 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// Per-surface "the user has scrolled up, so a jump-to-bottom affordance
     /// should show" flag, keyed by surface id.
     ///
-    /// Updated from every processed render-grid frame's authoritative
-    /// `atBottom` hint (the Mac stamps it from its real surface's scrollbar; the
-    /// display-only mirror cannot derive viewport position locally). Absent or
+    /// Fed from every processed render-grid frame's authoritative `atBottom`
+    /// hint (the Mac stamps it from its real surface's scrollbar; the
+    /// display-only mirror cannot derive viewport position locally) through
+    /// ``ingestTerminalScrolledUpSignal(surfaceID:scrolledUp:)``. Absent or
     /// `false` means at-bottom → the floating button stays hidden; `true` means
     /// scrolled up → the button shows. Read through ``terminalScrolledUp(surfaceID:)``.
     public private(set) var terminalScrolledUpBySurfaceID: [String: Bool] = [:]
+    /// How long the raw per-frame scrolled-up signal must hold a new value
+    /// before the displayed ``terminalScrolledUpBySurfaceID`` flips to it.
+    /// Long enough to swallow single-frame and short multi-frame blips of the
+    /// Mac-stamped `atBottom` hint (boundary noise during drags and streaming
+    /// output), short enough that a genuine scroll into scrollback still feels
+    /// immediate.
+    static let scrolledUpStabilityWindow: Duration = .milliseconds(250)
+    /// Clock driving the scrolled-up stability window. Injected so tests flip
+    /// the hysteresis with virtual time instead of real waiting.
+    @ObservationIgnored private let scrolledUpSignalClock: any Clock<Duration>
     /// Guards ``submitComposerInput()`` against re-entrancy. A quick double tap
     /// on Send would otherwise start two sends that both capture the same text
     /// (the field is cleared only on ack), pasting the message to the agent
@@ -547,10 +558,12 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         diagnosticLog: DiagnosticLog? = nil,
         draftStore: (any TerminalDraftStoring)? = nil,
         feedbackEmailSubmitter: (any MobileFeedbackEmailSubmitting)? = nil,
-        feedbackStampProvider: @escaping @MainActor () -> MobileFeedbackStamp = { MobileShellComposite.emptyFeedbackStamp }
+        feedbackStampProvider: @escaping @MainActor () -> MobileFeedbackStamp = { MobileShellComposite.emptyFeedbackStamp },
+        scrolledUpSignalClock: any Clock<Duration> = ContinuousClock()
     ) {
         self.runtime = runtime
         self.draftStore = draftStore
+        self.scrolledUpSignalClock = scrolledUpSignalClock
         self.pairedMacStore = pairedMacStore
         self.deviceRegistry = deviceRegistry
         self.identityProvider = identityProvider
@@ -742,14 +755,17 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         terminalScrolledUpBySurfaceID[surfaceID] ?? false
     }
 
-    /// Record the authoritative scrolled-up state for a surface from a processed
-    /// render-grid frame. Idempotent: an unchanged value does not touch the
-    /// observable dictionary, so a steady stream of at-bottom frames does not
-    /// invalidate the SwiftUI views observing it.
-    private func updateTerminalScrolledUp(surfaceID: String, scrolledUp: Bool) {
+    /// Ingest the raw per-frame scrolled-up signal for a surface from a
+    /// processed render-grid frame. Idempotent: an unchanged value does not
+    /// touch the observable dictionary, so a steady stream of at-bottom frames
+    /// does not invalidate the SwiftUI views observing it.
+    func ingestTerminalScrolledUpSignal(surfaceID: String, scrolledUp: Bool) {
         guard terminalScrolledUpBySurfaceID[surfaceID] != scrolledUp else { return }
         terminalScrolledUpBySurfaceID[surfaceID] = scrolledUp
     }
+
+    /// Wait until every pending scrolled-up settle has resolved. Test seam.
+    func drainScrolledUpSettleForTesting() async {}
 
     /// Jump the Mac's real surface for `surfaceID` to the live bottom (out of
     /// scrollback). The phone's display-only mirror has no local scrollback, so
@@ -4354,7 +4370,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         // (non-stale) frame so the floating jump-to-bottom button shows only
         // when the user has scrolled up. Updated even when the patch is empty
         // (a pure scroll can produce a delta with no cell changes).
-        updateTerminalScrolledUp(
+        ingestTerminalScrolledUpSignal(
             surfaceID: renderGrid.surfaceID,
             scrolledUp: renderGrid.hasRoomToScrollToBottom
         )
