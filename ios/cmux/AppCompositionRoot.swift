@@ -31,6 +31,11 @@ final class AppCompositionRoot {
     /// one-time onboarding screen.
     let onboardingStore: MobileOnboardingStore
 
+    /// The process-wide tailnet detector behind the shell UI's read-only
+    /// observing port, injected down so pairing and disconnected surfaces can
+    /// explain a Tailscale-off phone.
+    let tailscaleStatusMonitor: TailscaleStatusMonitorAdapter
+
     #if DEBUG
     /// The structured diagnostic log, built once here and injected into the
     /// shell store. DEBUG-only: it backs the DEV dogfood feedback round-trip and
@@ -69,6 +74,7 @@ final class AppCompositionRoot {
             defaults: .standard,
             forceSeen: bypassOnboarding
         )
+        self.tailscaleStatusMonitor = TailscaleStatusMonitorAdapter(monitor: TailscaleStatusMonitor())
         #if DEBUG
         self.diagnosticLog = DiagnosticLog(buildStamp: MobileDebugLog.buildStamp)
         #endif
