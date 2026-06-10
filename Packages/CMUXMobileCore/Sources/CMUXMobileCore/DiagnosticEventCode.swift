@@ -183,4 +183,8 @@ public enum DiagnosticEventCode: UInt16, Sendable, Codable, CaseIterable {
     /// a frozen screen confirms the GPU/swap-chain `render_now` itself stalled rather
     /// than the stream drying up. RENDER: render-busy duration.
     case renderCompleted = 27
+
+    /// A pairing attempt was short-circuited because the device had no network
+    /// path (the reachability preflight failed before any connect).
+    case pairUnreachable = 28
 }
