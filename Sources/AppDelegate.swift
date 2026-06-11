@@ -838,6 +838,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     /// Strongly-held observers for every active TabManager. Each observer owns
     /// Combine subscriptions that publish workspace.updated to mobile clients.
     private var mobileWorkspaceListObservers: [ObjectIdentifier: MobileWorkspaceListObserver] = [:]
+    /// Single app-lifetime observer that streams the notification feed to paired
+    /// phones over the `notifications.updated` topic. Unlike the workspace
+    /// observer (one per window's `TabManager`), this watches the
+    /// `TerminalNotificationStore` singleton, so there is exactly one instance.
+    private var mobileNotificationListObserver: MobileNotificationListObserver?
 
     /// The app's settings dependency container, handed over by `cmuxApp` via
     /// `configure(...)` before any main window is created. AppKit builds the
@@ -1956,6 +1961,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         )
         auth.start()
         ensureMobileWorkspaceListObserver(for: tabManager)
+        ensureMobileNotificationListObserver()
         MobileTerminalRenderObserver.shared.start()
         installMobileHostSettingsObserver()
         scheduleGhosttyCrashBreadcrumbIfNeeded(notificationStore: notificationStore)
@@ -4390,7 +4396,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
     func ensureMobileWorkspaceListObserver(for tabManager: TabManager) {
         let id = ObjectIdentifier(tabManager)
         if mobileWorkspaceListObservers[id] == nil {
-            mobileWorkspaceListObservers[id] = MobileWorkspaceListObserver(tabManager: tabManager)
+            mobileWorkspaceListObservers[id] = MobileWorkspaceListObserver(tabManager: tabManager, notificationStore: notificationStore)
+        }
+    }
+
+    /// Start the single notification-feed observer if it is not already running.
+    /// Observes `TerminalNotificationStore.shared` (the same store the mobile
+    /// RPC handlers read), so the live feed and the snapshot agree.
+    func ensureMobileNotificationListObserver() {
+        if mobileNotificationListObserver == nil {
+            mobileNotificationListObserver = MobileNotificationListObserver(store: .shared)
         }
     }
 

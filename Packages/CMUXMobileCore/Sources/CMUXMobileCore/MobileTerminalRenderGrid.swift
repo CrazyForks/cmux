@@ -43,6 +43,25 @@ public struct MobileTerminalRenderGridFrame: Codable, Equatable, Sendable {
     /// Styled spans for the scrollback lines, row index `0..<scrollbackRows`
     /// (oldest first). Reuses ``styles`` by `styleID`.
     public var scrollbackSpans: [RowSpan]
+    /// Whether the producing surface's viewport is pinned to the live bottom of
+    /// the terminal (the last row is visible), i.e. NOT scrolled up into
+    /// scrollback. Authoritative viewport-position hint exported by the Mac from
+    /// its real surface's scrollbar (`offset + len >= total`); the mobile mirror
+    /// has no local scrollback of its own so it cannot derive this. `nil` when
+    /// the producer did not report a position (treated as "at bottom" by the
+    /// client so the jump-to-bottom affordance stays hidden by default).
+    public var atBottom: Bool?
+
+    /// Whether a jump-to-bottom affordance should be shown for this frame.
+    ///
+    /// The viewport has room to scroll down (the user has scrolled up into
+    /// scrollback) only when the producer explicitly reported ``atBottom`` as
+    /// `false`. A `nil` position (producer did not report, e.g. an older Mac
+    /// build) or `true` (pinned at the bottom) both keep the affordance hidden,
+    /// so the button never appears spuriously when the position is unknown.
+    public var hasRoomToScrollToBottom: Bool {
+        atBottom == false
+    }
 
     public init(
         format: String = Self.currentFormat,
@@ -61,7 +80,8 @@ public struct MobileTerminalRenderGridFrame: Codable, Equatable, Sendable {
         terminalBackground: String? = nil,
         terminalCursorColor: String? = nil,
         scrollbackRows: Int = 0,
-        scrollbackSpans: [RowSpan] = []
+        scrollbackSpans: [RowSpan] = [],
+        atBottom: Bool? = nil
     ) throws {
         guard format == Self.currentFormat else {
             throw MobileTerminalRenderGridError.invalidFormat(format)
@@ -138,6 +158,7 @@ public struct MobileTerminalRenderGridFrame: Codable, Equatable, Sendable {
         self.terminalCursorColor = terminalCursorColor
         self.scrollbackRows = full ? resolvedScrollbackRows : 0
         self.scrollbackSpans = full ? scrollbackSpans : []
+        self.atBottom = atBottom
     }
 
     public init(from decoder: Decoder) throws {
@@ -159,6 +180,7 @@ public struct MobileTerminalRenderGridFrame: Codable, Equatable, Sendable {
         let terminalCursorColor = try container.decodeIfPresent(String.self, forKey: .terminalCursorColor)
         let scrollbackRows = try container.decodeIfPresent(Int.self, forKey: .scrollbackRows) ?? 0
         let scrollbackSpans = try container.decodeIfPresent([RowSpan].self, forKey: .scrollbackSpans) ?? []
+        let atBottom = try container.decodeIfPresent(Bool.self, forKey: .atBottom)
         try self.init(
             format: format,
             surfaceID: surfaceID,
@@ -176,7 +198,8 @@ public struct MobileTerminalRenderGridFrame: Codable, Equatable, Sendable {
             terminalBackground: terminalBackground,
             terminalCursorColor: terminalCursorColor,
             scrollbackRows: scrollbackRows,
-            scrollbackSpans: scrollbackSpans
+            scrollbackSpans: scrollbackSpans,
+            atBottom: atBottom
         )
     }
 
@@ -294,7 +317,11 @@ public struct MobileTerminalRenderGridFrame: Codable, Equatable, Sendable {
             terminalBackground: full ? terminalBackground : nil,
             terminalCursorColor: full ? terminalCursorColor : nil,
             scrollbackRows: full ? scrollbackRows : 0,
-            scrollbackSpans: full ? scrollbackSpans : []
+            scrollbackSpans: full ? scrollbackSpans : [],
+            // Viewport position is independent of full vs delta: a delta frame
+            // emitted mid-scroll still carries the live at-bottom state so the
+            // jump-to-bottom affordance tracks during a drag.
+            atBottom: atBottom
         )
     }
 
@@ -405,6 +432,7 @@ public struct MobileTerminalRenderGridFrame: Codable, Equatable, Sendable {
         case terminalCursorColor = "terminal_cursor_color"
         case scrollbackRows = "scrollback_rows"
         case scrollbackSpans = "scrollback_spans"
+        case atBottom = "at_bottom"
     }
 
     /// Which terminal screen a full snapshot represents.

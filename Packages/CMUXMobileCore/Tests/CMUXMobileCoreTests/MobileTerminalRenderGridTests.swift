@@ -417,3 +417,77 @@ import Testing
         #expect(replay.patchBytes() == replay.replacementBytes())
     }
 }
+
+// MARK: - Jump-to-bottom viewport-position signal
+
+@Test func renderGridHasRoomToScrollOnlyWhenProducerReportsScrolledUp() throws {
+    func frame(atBottom: Bool?) throws -> MobileTerminalRenderGridFrame {
+        try MobileTerminalRenderGridFrame(
+            surfaceID: "terminal-a",
+            stateSeq: 7,
+            columns: 4,
+            rows: 2,
+            rowSpans: [.init(row: 0, column: 0, text: "ok")],
+            atBottom: atBottom
+        )
+    }
+    // Scrolled up (producer reported NOT at bottom): the button shows.
+    #expect(try frame(atBottom: false).hasRoomToScrollToBottom)
+    // Pinned at the bottom: hidden.
+    #expect(try frame(atBottom: true).hasRoomToScrollToBottom == false)
+    // Unknown position (older Mac / no scrollbar yet): hidden, never spurious.
+    #expect(try frame(atBottom: nil).hasRoomToScrollToBottom == false)
+}
+
+@Test func renderGridAtBottomSurvivesJSONRoundTrip() throws {
+    for value in [true, false] {
+        let frame = try MobileTerminalRenderGridFrame(
+            surfaceID: "terminal-a",
+            stateSeq: 9,
+            columns: 4,
+            rows: 2,
+            rowSpans: [.init(row: 0, column: 0, text: "ok")],
+            atBottom: value
+        )
+        let decoded = try MobileTerminalRenderGridFrame.decodeJSONObject(frame.jsonObject())
+        #expect(decoded.atBottom == value)
+        #expect(decoded == frame)
+    }
+}
+
+@Test func renderGridDecodesMissingAtBottomAsUnknown() throws {
+    // A frame produced by an older Mac build has no `at_bottom` key; it must
+    // decode to nil (treated as at-bottom) so the button stays hidden.
+    var object = try MobileTerminalRenderGridFrame(
+        surfaceID: "terminal-a",
+        stateSeq: 11,
+        columns: 4,
+        rows: 2,
+        rowSpans: [.init(row: 0, column: 0, text: "ok")],
+        atBottom: true
+    ).jsonObject()
+    object.removeValue(forKey: "at_bottom")
+    let decoded = try MobileTerminalRenderGridFrame.decodeJSONObject(object)
+    #expect(decoded.atBottom == nil)
+    #expect(decoded.hasRoomToScrollToBottom == false)
+}
+
+@Test func renderGridDeltaFrameCarriesAtBottom() throws {
+    // A delta frame emitted mid-scroll must keep the live at-bottom state so the
+    // affordance tracks during a drag.
+    let full = try MobileTerminalRenderGridFrame(
+        surfaceID: "terminal-a",
+        stateSeq: 13,
+        columns: 4,
+        rows: 2,
+        rowSpans: [
+            .init(row: 0, column: 0, text: "ab"),
+            .init(row: 1, column: 0, text: "cd"),
+        ],
+        atBottom: false
+    )
+    let delta = try full.filteredRows([1], full: false)
+    #expect(delta.full == false)
+    #expect(delta.atBottom == false)
+    #expect(delta.hasRoomToScrollToBottom)
+}

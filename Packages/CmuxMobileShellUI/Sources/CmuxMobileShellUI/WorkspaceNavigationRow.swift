@@ -8,6 +8,8 @@ struct WorkspaceNavigationRow: View {
     let isSelected: Bool
     let navigationStyle: WorkspaceNavigationStyle
     let wrapWorkspaceTitles: Bool
+    /// Unread-notification count for this workspace (plain value snapshot).
+    var unreadCount: Int = 0
     let selectWorkspace: (MobileWorkspacePreview.ID) -> Void
     /// Rename the workspace on the Mac. When `nil` (e.g. previews) the rename
     /// affordance is hidden.
@@ -15,6 +17,12 @@ struct WorkspaceNavigationRow: View {
     /// Pin or unpin the workspace on the Mac. When `nil` the pin affordance is
     /// hidden.
     var setPinned: ((MobileWorkspacePreview.ID, Bool) -> Void)?
+    /// Whether the user has muted phone push for this workspace (value snapshot).
+    var isMuted: Bool = false
+    /// Mute or unmute phone push for this workspace. Phone-local (no Mac RPC), so
+    /// it is offered regardless of the connected Mac's capabilities. When `nil`
+    /// (e.g. previews) the mute affordance is hidden.
+    var setMuted: ((MobileWorkspacePreview.ID, Bool) -> Void)?
 
     @State private var isRenaming = false
 
@@ -27,7 +35,9 @@ struct WorkspaceNavigationRow: View {
                         workspace: workspace,
                         connectionStatus: connectionStatus,
                         isSelected: false,
-                        wrapWorkspaceTitles: wrapWorkspaceTitles
+                        wrapWorkspaceTitles: wrapWorkspaceTitles,
+                        isMuted: isMuted,
+                        unreadCount: unreadCount
                     )
                 }
                 .simultaneousGesture(TapGesture().onEnded {
@@ -41,7 +51,9 @@ struct WorkspaceNavigationRow: View {
                         workspace: workspace,
                         connectionStatus: connectionStatus,
                         isSelected: isSelected,
-                        wrapWorkspaceTitles: wrapWorkspaceTitles
+                        wrapWorkspaceTitles: wrapWorkspaceTitles,
+                        isMuted: isMuted,
+                        unreadCount: unreadCount
                     )
                 }
                 .buttonStyle(.plain)
@@ -81,6 +93,24 @@ struct WorkspaceNavigationRow: View {
                 Label(L10n.string("mobile.workspace.rename.action", defaultValue: "Rename"), systemImage: "pencil")
             }
             .accessibilityIdentifier("MobileWorkspaceRenameButton-\(workspace.id.rawValue)")
+        }
+        if let setMuted {
+            Button {
+                setMuted(workspace.id, !isMuted)
+            } label: {
+                if isMuted {
+                    Label(
+                        L10n.string("mobile.workspace.unmuteNotifications", defaultValue: "Unmute Notifications"),
+                        systemImage: "bell"
+                    )
+                } else {
+                    Label(
+                        L10n.string("mobile.workspace.muteNotifications", defaultValue: "Mute Notifications"),
+                        systemImage: "bell.slash"
+                    )
+                }
+            }
+            .accessibilityIdentifier("MobileWorkspaceMuteButton-\(workspace.id.rawValue)")
         }
     }
 }

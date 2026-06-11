@@ -38,11 +38,16 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         case rawBytes
 
         var eventTopics: [String] {
+            // `notifications.updated` is appended to BOTH transports: the Mac's
+            // notification observer emits it independent of the terminal output
+            // path, and `MobileHostService.emitEvent` drops any topic with no
+            // subscriber, so the phone must subscribe here or the live feed never
+            // arrives.
             switch self {
             case .renderGrid:
-                return ["workspace.updated", "terminal.render_grid"]
+                return ["workspace.updated", "terminal.render_grid", "notification.dismissed", "notifications.updated"]
             case .rawBytes:
-                return ["workspace.updated", "terminal.bytes"]
+                return ["workspace.updated", "terminal.bytes", "notification.dismissed", "notifications.updated"]
             }
         }
     }
@@ -59,7 +64,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
 
     private static let terminalRenderGridCapability = "terminal.render_grid.v1"
     private static let workspaceActionsCapability = "workspace.actions.v1"
+    private static let terminalPasteCapability = "terminal.paste.v1"
     private static let dogfoodFeedbackCapability = "dogfood.v1"
+    private static let workspaceGroupsCapability = "workspace.groups.v1"
     private static let terminalOutputCapabilityTimeoutNanoseconds: UInt64 = 750_000_000
 
     /// How long the render-grid stream may stay silent (no event of any topic)
@@ -119,6 +126,22 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     public private(set) var macConnectionStatus: MobileMacConnectionStatus
     public private(set) var connectedHostName: String
     public private(set) var connectionError: String?
+
+    /// Transient notice for a pasted image that could not be sent (too large to
+    /// fit the sync frame, or rejected by the Mac's clipboard-image cap).
+    ///
+    /// Distinct from ``connectionError``: an oversized paste is not a connection
+    /// problem, so it must not drive the connection-recovery banner (Retry / mark
+    /// Mac unavailable). The UI shows this as a short-lived toast and clears it via
+    /// ``dismissPasteImageNotice()``.
+    public private(set) var pasteImageNotice: String?
+
+    /// Monotonic token bumped every time a paste notice is set, even when the
+    /// localized text is identical. The toast keys its auto-dismiss timer on this
+    /// so a second oversized paste restarts the 3-second lifecycle instead of
+    /// being dismissed early by the first paste's still-pending timer.
+    public private(set) var pasteImageNoticeToken: Int = 0
+
     /// Actionable next-step line shown beneath ``connectionError`` (for example
     /// "Check that both devices are on the same Tailscale"). Set and cleared
     /// together with the error by the pairing-failure classifier sink.
@@ -178,11 +201,32 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     }
     public var pairingCode: String
     public var workspaces: [MobileWorkspacePreview]
+    /// Phone-side mirror of the Mac's notification feed. Streamed live over the
+    /// `notifications.updated` event topic (snapshot refetched via
+    /// `mobile.notifications.list`), it drives the Notifications tab feed and the
+    /// per-workspace unread badges.
+    public let notificationsStore = MobileNotificationsStore()
+    /// The Mac's workspace groups, in section order. Empty when the Mac reports no
+    /// groups (or is old enough not to emit them). Drives the collapsible group
+    /// sections in the workspace list.
+    public var workspaceGroups: [MobileWorkspaceGroupPreview] = []
+    /// Whether the connected Mac advertises the `workspace.groups.v1` capability
+    /// (group sections in the list + `workspace.group.collapse`/`expand` over the
+    /// mobile RPC). `false` until host status is read, and for older Macs that
+    /// lack the handler, so the UI can render a flat list instead of group UI that
+    /// would not round-trip.
+    public private(set) var supportsWorkspaceGroups: Bool = false
     /// Whether the connected Mac advertises the `workspace.actions.v1` capability
     /// (rename/pin over the mobile RPC). `false` until host status is read, and
     /// for older Macs that lack the handler, so the UI can hide rename/pin rather
     /// than offer actions that would fail with `method_not_found`.
     public private(set) var supportsWorkspaceActions: Bool = false
+    /// Whether the connected Mac advertises the `terminal.paste.v1` capability
+    /// (the bracketed-paste `terminal.paste` RPC). `false` until host status is
+    /// read, and for older Macs that lack the handler, so multi-character commits
+    /// (dictation, autocorrect, keyboard/clipboard paste) fall back to per-key
+    /// `terminal.input` instead of being dropped with `method_not_found`.
+    public private(set) var supportsTerminalPaste: Bool = false
     /// Whether the connected Mac advertises the `dogfood.v1` capability (the
     /// `dogfood.feedback.submit` agent sink). `false` until host status is read,
     /// and for older Macs that lack the handler, so the privileged Send Feedback
@@ -277,6 +321,33 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// reliably deliver its final unfocus change. Not observed: bookkeeping for
     /// the switch decision, not view state.
     @ObservationIgnored private var composerFieldIsFocused = false
+    /// Per-surface "the user has scrolled up, so a jump-to-bottom affordance
+    /// should show" flag, keyed by surface id.
+    ///
+    /// Fed from every processed render-grid frame's authoritative `atBottom`
+    /// hint (the Mac stamps it from its real surface's scrollbar; the
+    /// display-only mirror cannot derive viewport position locally) through
+    /// ``ingestTerminalScrolledUpSignal(surfaceID:scrolledUp:)``. Absent or
+    /// `false` means at-bottom → the floating button stays hidden; `true` means
+    /// scrolled up → the button shows. Read through ``terminalScrolledUp(surfaceID:)``.
+    public private(set) var terminalScrolledUpBySurfaceID: [String: Bool] = [:]
+    /// How long the raw per-frame scrolled-up signal must hold a new value
+    /// before the displayed ``terminalScrolledUpBySurfaceID`` flips to it.
+    /// Long enough to swallow single-frame and short multi-frame blips of the
+    /// Mac-stamped `atBottom` hint (boundary noise during drags and streaming
+    /// output), short enough that a genuine scroll into scrollback still feels
+    /// immediate.
+    static let scrolledUpStabilityWindow: Duration = .milliseconds(250)
+    /// Clock driving the scrolled-up stability window. Injected so tests flip
+    /// the hysteresis with virtual time instead of real waiting.
+    @ObservationIgnored private let scrolledUpSignalClock: any Clock<Duration>
+    /// Pending settle task per surface: the deferred flip of
+    /// ``terminalScrolledUpBySurfaceID`` to the raw signal's new value once it
+    /// has held for ``scrolledUpStabilityWindow``. At most one per surface, and
+    /// it always targets the opposite of the displayed value (a raw frame that
+    /// matches the displayed value cancels it instead). Not observed:
+    /// bookkeeping, not view state.
+    @ObservationIgnored private var scrolledUpSettleTaskBySurfaceID: [String: Task<Void, Never>] = [:]
     /// Guards ``submitComposerInput()`` against re-entrancy. A quick double tap
     /// on Send would otherwise start two sends that both capture the same text
     /// (the field is cleared only on ack), pasting the message to the agent
@@ -365,6 +436,19 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// view state.
     @ObservationIgnored private var draftLoadPendingTerminalID: MobileTerminalPreview.ID?
 
+    /// An explicit "open this workspace now" request, distinct from a passive
+    /// `selectedWorkspaceID` change.
+    ///
+    /// Passive selection changes (the Mac selecting a different sidebar tab) must
+    /// NOT yank the compact iPhone UI from its root list into a workspace, so
+    /// `WorkspaceShellView`'s navigation policy deliberately stays put at root on
+    /// a selection change. A notification tap (or any deep-link) is the opposite:
+    /// the user explicitly asked to open that workspace, so the compact stack
+    /// must push it. The id plus a monotonic token lets the view push even when
+    /// the target is already the selection (re-tapping the same workspace).
+    public private(set) var pendingWorkspaceOpenRequest: (id: MobileWorkspacePreview.ID, token: Int)?
+    private var workspaceOpenRequestCounter = 0
+
     /// Surface IDs whose next window attach must NOT grab the keyboard.
     ///
     /// A surface in this set mounts with autofocus disabled; the entry is
@@ -386,8 +470,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     private let deviceRegistry: (any DeviceRegistryRefreshing)?
     private let identityProvider: (any MobileIdentityProviding)?
     private let reachability: any ReachabilityProviding
+    private let deliveredNotificationClearer: any DeliveredNotificationClearing
     private let pairingHintDefaults: UserDefaults
-    private let clientID: String
+    let clientID: String
     /// Delivers the email path of Send Feedback (`/api/feedback`). `nil` when the
     /// web API base URL is unavailable; the email path then fails closed and the
     /// UI surfaces an error rather than silently dropping the report.
@@ -428,7 +513,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// `public` so the DEV feedback-submit affordance can ``DiagnosticLog/export()``
     /// it.
     public let diagnosticLog: DiagnosticLog?
-    private var remoteClient: MobileCoreRPCClient? {
+    var remoteClient: MobileCoreRPCClient? {
         didSet {
             if remoteClient == nil {
                 stopTerminalRefreshPolling()
@@ -439,6 +524,18 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     }
     private var terminalEventListenerTask: Task<Void, Never>?
     private var terminalEventListenerID: UUID?
+    #if DEBUG
+    /// The floating DEV dogfood pane's model. Injected from the composition root
+    /// so the dedicated ``dogfood.checklist`` subscription can feed it
+    /// agent-pushed checklists. `weak` because the pane window owns the model's
+    /// lifetime, not the shell. DEBUG-only.
+    private weak var dogfoodFeedbackModel: DogfoodFeedbackModel?
+    /// The dedicated, durable ``dogfood.checklist`` subscription task. Kept
+    /// separate from ``terminalEventListenerTask`` so the render-grid liveness
+    /// watchdog's ~9s re-subscribe never tears it down (it does not carry the
+    /// checklist topic). DEBUG-only.
+    private var dogfoodChecklistListenerTask: Task<Void, Never>?
+    #endif
     // Liveness watchdog for the render-grid push subscription. The `for await`
     // listener loop blocks indefinitely if the underlying connection half-dies
     // (network blip, Mac stops pushing, background/foreground cycle): the
@@ -452,6 +549,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     private var renderGridLivenessListenerID: UUID?
     private var lastTerminalEventAt: Date?
     private var terminalSubscriptionRefreshTask: Task<Void, Never>?
+    private var notificationsRefreshTask: Task<Void, Never>?
     private var createWorkspaceTask: Task<Void, Never>?
     private var createTerminalTask: Task<Void, Never>?
     private var workspaceListRefreshTask: Task<Void, Never>?
@@ -523,19 +621,23 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         clientIDRepository: MobileClientIDRepository = MobileClientIDRepository(defaults: .standard),
         identityProvider: (any MobileIdentityProviding)? = nil,
         reachability: any ReachabilityProviding = ReachabilityService(),
+        deliveredNotificationClearer: any DeliveredNotificationClearing = SystemDeliveredNotificationClearer(),
         pairingHintDefaults: UserDefaults = .standard,
         analytics: any AnalyticsEmitting = NoopAnalytics(),
         diagnosticLog: DiagnosticLog? = nil,
+        draftStore: (any TerminalDraftStoring)? = nil,
         feedbackEmailSubmitter: (any MobileFeedbackEmailSubmitting)? = nil,
         feedbackStampProvider: @escaping @MainActor () -> MobileFeedbackStamp = { MobileShellComposite.emptyFeedbackStamp },
-        draftStore: (any TerminalDraftStoring)? = nil
+        scrolledUpSignalClock: any Clock<Duration> = ContinuousClock()
     ) {
         self.runtime = runtime
         self.draftStore = draftStore
+        self.scrolledUpSignalClock = scrolledUpSignalClock
         self.pairedMacStore = pairedMacStore
         self.deviceRegistry = deviceRegistry
         self.identityProvider = identityProvider
         self.reachability = reachability
+        self.deliveredNotificationClearer = deliveredNotificationClearer
         self.pairingHintDefaults = pairingHintDefaults
         self.analytics = analytics
         self.diagnosticLog = diagnosticLog
@@ -587,6 +689,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     }
 
     isolated deinit {
+        for task in scrolledUpSettleTaskBySurfaceID.values {
+            task.cancel()
+        }
         networkPathObservationTask?.cancel()
         terminalEventListenerTask?.cancel()
         renderGridLivenessTimer?.cancel()
@@ -727,6 +832,103 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         }
     }
 
+    /// Whether the given surface is scrolled up (has room to jump to the live
+    /// bottom), driving the floating jump-to-bottom button's visibility.
+    ///
+    /// Defaults to `false` (button hidden) when no frame has reported a position
+    /// yet, so the affordance never appears spuriously on a fresh attach.
+    public func terminalScrolledUp(surfaceID: String) -> Bool {
+        terminalScrolledUpBySurfaceID[surfaceID] ?? false
+    }
+
+    /// Ingest the raw per-frame scrolled-up signal for a surface from a
+    /// processed render-grid frame, applying time hysteresis before it reaches
+    /// the displayed ``terminalScrolledUpBySurfaceID``.
+    ///
+    /// The raw signal is the Mac's per-frame `atBottom` hint, which blips near
+    /// the at-bottom boundary (drags, streaming output); mirroring it directly
+    /// made the floating button flicker. The displayed value flips only after
+    /// the raw signal has held the opposite value for
+    /// ``scrolledUpStabilityWindow``: a frame that disagrees with the displayed
+    /// value starts (at most one) settle task, and a frame that agrees with the
+    /// displayed value cancels it, so a blip shorter than the window never
+    /// reaches the UI in either direction. Steady agreeing frames are no-ops
+    /// and do not invalidate the SwiftUI views observing the dictionary.
+    func ingestTerminalScrolledUpSignal(surfaceID: String, scrolledUp: Bool) {
+        let displayed = terminalScrolledUpBySurfaceID[surfaceID] ?? false
+        guard scrolledUp != displayed else {
+            // The raw signal returned to the displayed value before the window
+            // elapsed: revoke the pending flip — the blip never shows.
+            scrolledUpSettleTaskBySurfaceID.removeValue(forKey: surfaceID)?.cancel()
+            return
+        }
+        // Already settling toward this value (the only possible target is
+        // `!displayed`); let the original window keep counting.
+        guard scrolledUpSettleTaskBySurfaceID[surfaceID] == nil else { return }
+        let clock = scrolledUpSignalClock
+        scrolledUpSettleTaskBySurfaceID[surfaceID] = Task { [weak self] in
+            // Bounded, cancellable stability window (the hysteresis itself),
+            // driven by the injected clock; a counter-signal cancels it via the
+            // stored task, and `isCancelled` re-checks after the actor hop so a
+            // revocation that raced the wakeup still wins.
+            guard (try? await clock.sleep(for: Self.scrolledUpStabilityWindow)) != nil,
+                  !Task.isCancelled else { return }
+            self?.applySettledScrolledUp(surfaceID: surfaceID, scrolledUp: scrolledUp)
+        }
+    }
+
+    /// Apply a settle task's flip once its stability window elapsed
+    /// uncancelled. Clears the task slot first so a follow-up counter-signal
+    /// starts a fresh window. Only ever called by the surface's own pending
+    /// task (uncancelled tasks are never replaced), so the slot is its own.
+    private func applySettledScrolledUp(surfaceID: String, scrolledUp: Bool) {
+        scrolledUpSettleTaskBySurfaceID[surfaceID] = nil
+        terminalScrolledUpBySurfaceID[surfaceID] = scrolledUp
+    }
+
+    /// Wait until every pending scrolled-up settle has resolved (applied or
+    /// been cancelled). Test seam: lets tests assert the displayed state
+    /// without sleeping. Snapshots the tasks first; awaiting a sleeping task
+    /// requires the test to advance its manual clock beforehand.
+    func drainScrolledUpSettleForTesting() async {
+        for task in scrolledUpSettleTaskBySurfaceID.values {
+            await task.value
+        }
+    }
+
+    /// Jump the Mac's real surface for `surfaceID` to the live bottom (out of
+    /// scrollback). The phone's display-only mirror has no local scrollback, so
+    /// the jump-to-latest tap routes to the Mac, which scrolls its surface and
+    /// emits a render frame reporting at-bottom, hiding the button. Mirrors
+    /// ``scrollTerminal(surfaceID:lines:col:row:)``. Fire-and-forget.
+    public func scrollTerminalToBottom(surfaceID: String) async {
+        // The tap's intent is "go to the bottom now": hide the affordance
+        // immediately (revoking any pending settle) instead of waiting a render
+        // round-trip plus stability window. If the jump fails, the next frames
+        // still report scrolled-up and the button returns through the window.
+        scrolledUpSettleTaskBySurfaceID.removeValue(forKey: surfaceID)?.cancel()
+        if terminalScrolledUpBySurfaceID[surfaceID] == true {
+            terminalScrolledUpBySurfaceID[surfaceID] = false
+        }
+        guard let client = remoteClient,
+              let workspaceID = workspaceID(forTerminalID: surfaceID) else {
+            return
+        }
+        do {
+            let request = try MobileCoreRPCClient.requestData(
+                method: "mobile.terminal.scroll_to_bottom",
+                params: [
+                    "workspace_id": workspaceID.rawValue,
+                    "surface_id": surfaceID,
+                    "client_id": clientID,
+                ]
+            )
+            _ = try await client.sendRequest(request)
+        } catch {
+            mobileShellLog.error("scroll-to-bottom forward failed surface=\(surfaceID, privacy: .public) error=\(String(describing: error), privacy: .public)")
+        }
+    }
+
     /// Forward a tap to the Mac's real surface as a left click at the given grid
     /// cell. libghostty self-gates: a TUI with mouse reporting receives the
     /// click; a normal screen treats it as a harmless empty selection. The
@@ -753,62 +955,6 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         }
     }
 
-    // MARK: - Workspace actions
-
-    /// Rename a workspace on the Mac.
-    ///
-    /// Fire-and-forget against the authoritative state: the Mac applies the title
-    /// and its workspace-list observer pushes `workspace.updated`, which refreshes
-    /// this list. No local optimistic mutation, so overlapping actions can never
-    /// leave stale state.
-    /// - Parameters:
-    ///   - id: The workspace to rename.
-    ///   - title: The new title. Whitespace-only titles are ignored.
-    public func renameWorkspace(id: MobileWorkspacePreview.ID, title: String) async {
-        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, let client = remoteClient else { return }
-        do {
-            let request = try MobileCoreRPCClient.requestData(
-                method: "workspace.action",
-                params: [
-                    "workspace_id": id.rawValue,
-                    "action": "rename",
-                    "title": trimmed,
-                    "client_id": clientID,
-                ]
-            )
-            _ = try await client.sendRequest(request)
-        } catch {
-            mobileShellLog.error("workspace rename failed id=\(id.rawValue, privacy: .public) error=\(String(describing: error), privacy: .public)")
-        }
-    }
-
-    /// Pin or unpin a workspace on the Mac.
-    ///
-    /// Fire-and-forget against the authoritative state: the Mac toggles the pin
-    /// and its workspace-list observer (which watches `$isPinned`) pushes
-    /// `workspace.updated`, which refreshes this list. No local optimistic
-    /// mutation, so overlapping pin/unpin taps can never leave stale state.
-    /// - Parameters:
-    ///   - id: The workspace to pin or unpin.
-    ///   - pinned: `true` to pin, `false` to unpin.
-    public func setWorkspacePinned(id: MobileWorkspacePreview.ID, _ pinned: Bool) async {
-        guard let client = remoteClient else { return }
-        do {
-            let request = try MobileCoreRPCClient.requestData(
-                method: "workspace.action",
-                params: [
-                    "workspace_id": id.rawValue,
-                    "action": pinned ? "pin" : "unpin",
-                    "client_id": clientID,
-                ]
-            )
-            _ = try await client.sendRequest(request)
-        } catch {
-            mobileShellLog.error("workspace pin failed id=\(id.rawValue, privacy: .public) error=\(String(describing: error), privacy: .public)")
-        }
-    }
-
     /// Privileged direct-to-agent feedback round-trip: export the structured
     /// diagnostic log, package it with the supplied debug-log text, visible
     /// terminal text, and an optional freeform note, and submit it to the paired
@@ -829,6 +975,12 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     ///   - text: An optional freeform note from the user.
     ///   - debugLogText: The string debug-log snapshot (from `MobileDebugLog`).
     ///   - terminalText: The visible terminal text (from `GhosttySurfaceView`).
+    ///   - answersJSON: The P2 multiple-choice answers as canonical JSON
+    ///     (``CmuxMobileShellModel/DogfoodFeedbackAnswers``), or `nil` for the P1
+    ///     freeform-only path. An old (P1-only) Mac ignores the extra key.
+    ///   - screenshotPNG: The P2 chrome screenshot PNG (the terminal renders
+    ///     blank in a UIView snapshot, which is why the terminal *text* is sent
+    ///     too), or `nil`. Sent base64; an old Mac ignores the extra key.
     ///   - buildStamp: The build-identity stamp (build type + version + OS +
     ///     device) written into the bundle. Defaults to the diagnostic log's
     ///     stamp when not supplied.
@@ -838,6 +990,8 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         text: String,
         debugLogText: String,
         terminalText: String,
+        answersJSON: Data? = nil,
+        screenshotPNG: Data? = nil,
         buildStamp: String? = nil
     ) async -> Bool {
         guard let client = remoteClient else { return false }
@@ -857,7 +1011,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                     terminalText: terminalText,
                     buildStamp: buildStamp,
                     clientID: clientID,
-                    diagnosticBlob: diagnosticBlob
+                    diagnosticBlob: diagnosticBlob,
+                    answersJSON: answersJSON,
+                    screenshotPNG: screenshotPNG
                 )
             }.value
         } catch {
@@ -881,20 +1037,36 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     nonisolated private static let dogfoodFeedbackMaxTextChars = 16_384
     nonisolated private static let dogfoodFeedbackMaxTerminalChars = 262_144
     nonisolated private static let dogfoodFeedbackMaxDebugLogChars = 1_048_576
+    /// Drop the answers JSON past this size before attaching it, mirroring the
+    /// Mac sink's `answers_json` cap. The freeform note rides inside the answers
+    /// payload, so without this a pasted multi-MiB note would serialize and ship
+    /// uncapped (the separate `text` field is capped, but the same note is here
+    /// too). 64 KiB matches the Mac's `dogfoodFeedbackMaxAnswersChars`.
+    nonisolated private static let dogfoodFeedbackMaxAnswersBytes = 65_536
+    /// Drop a screenshot larger than this before encoding it, mirroring the Mac
+    /// sink's blob byte cap so a huge PNG can't be base64'd into a multi-MiB
+    /// request on the phone. A dropped screenshot still ships the rest of the
+    /// bundle (text + terminal + answers + diagnostics).
+    nonisolated private static let dogfoodFeedbackMaxScreenshotBytes = 6_291_456 // 6 MiB
 
     /// Combine the structured + string diagnostics into one self-contained blob,
-    /// base64-encode it, and build the RPC request — all off the main actor.
+    /// base64-encode it, attach the optional P2 answers + screenshot, and build
+    /// the RPC request — all off the main actor.
     ///
     /// The string debug log rides inside the same diagnostic file as the compact
     /// structured rows (rows, a divider, then the human-readable log) so the Mac
-    /// bundle is self-contained. Inputs are size-capped first.
+    /// bundle is self-contained. Inputs are size-capped first. The P2 fields are
+    /// added only when present, so a P1 freeform-only submit produces the exact
+    /// same params it did before (and an old Mac ignores the new keys).
     nonisolated private static func buildDogfoodFeedbackRequest(
         text: String,
         debugLogText: String,
         terminalText: String,
         buildStamp: String,
         clientID: String,
-        diagnosticBlob: Data
+        diagnosticBlob: Data,
+        answersJSON: Data?,
+        screenshotPNG: Data?
     ) throws -> Data {
         let cappedText = String(text.prefix(dogfoodFeedbackMaxTextChars))
         let cappedTerminal = String(terminalText.prefix(dogfoodFeedbackMaxTerminalChars))
@@ -904,16 +1076,235 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             combined.append(Data("\n----- mobile debug log -----\n".utf8))
             combined.append(Data(cappedDebugLog.utf8))
         }
-        return try MobileCoreRPCClient.requestData(
+        var params: [String: Any] = [
+            "text": cappedText,
+            "terminal_text": cappedTerminal,
+            "build_stamp": buildStamp,
+            "diagnostic_blob_base64": combined.base64EncodedString(),
+            "client_id": clientID,
+        ]
+        // Attach the answers JSON, keeping it under the Mac-side cap WITHOUT ever
+        // dropping the structured MC answers (the dogfooder's actual responses).
+        // The freeform note is the only unbounded contributor here, so if the
+        // encoded payload is over the byte cap, re-encode with a shrunk note that
+        // leaves room for the MC rows. The note also ships in the capped `text`
+        // field, so trimming it here loses nothing the bundle does not already
+        // carry. The model already byte-caps the note, so this is a backstop for
+        // a pathologically large agent-pushed checklist.
+        if let answersString = Self.cappedAnswersJSONString(
+            answersJSON,
+            maxBytes: dogfoodFeedbackMaxAnswersBytes
+        ) {
+            params["answers_json"] = answersString
+        }
+        // Attach the screenshot only if the *whole request frame* still fits the
+        // mobile transport's frame limit. The screenshot is the largest and most
+        // droppable field, and the diagnostic blob + terminal text + answers can
+        // already consume much of the budget, so a screenshot that passes its own
+        // byte cap could still push the frame over `defaultMaximumFrameByteCount`
+        // and make the transport throw `frameTooLarge` — failing the whole submit
+        // instead of just dropping the screenshot. So: build the request without
+        // the screenshot first, then re-add it only when the larger request still
+        // fits (with header + margin). This keeps the rest of the bundle shipping
+        // even when the screenshot has to be dropped.
+        let requestWithoutScreenshot = try MobileCoreRPCClient.requestData(
             method: "dogfood.feedback.submit",
-            params: [
-                "text": cappedText,
-                "terminal_text": cappedTerminal,
-                "build_stamp": buildStamp,
-                "diagnostic_blob_base64": combined.base64EncodedString(),
-                "client_id": clientID,
-            ]
+            params: params
         )
+        guard let screenshotPNG, screenshotPNG.count <= dogfoodFeedbackMaxScreenshotBytes else {
+            return requestWithoutScreenshot
+        }
+        let screenshotBase64 = screenshotPNG.base64EncodedString()
+        params["screenshot_png_base64"] = screenshotBase64
+        let requestWithScreenshot = try MobileCoreRPCClient.requestData(
+            method: "dogfood.feedback.submit",
+            params: params
+        )
+        let frameBudget = MobileSyncFrameCodec.defaultMaximumFrameByteCount - MobileSyncFrameCodec.headerByteCount
+        if requestWithScreenshot.count <= frameBudget {
+            return requestWithScreenshot
+        }
+        // The screenshot would overflow the frame; ship the rest without it.
+        return requestWithoutScreenshot
+    }
+
+    /// Return the answers JSON as a UTF-8 string capped under `maxBytes`, dropping
+    /// the freeform note (not the structured MC answers) when needed.
+    ///
+    /// The MC answers are the dogfooder's actual responses and must never be lost
+    /// silently, so when the encoded payload is over the cap this re-encodes the
+    /// same answers with an empty note (the note also rides in the capped `text`
+    /// field). Returns `nil` when there is no answers payload, the payload cannot
+    /// be decoded, or even the note-free encoding is still over the cap (a
+    /// pathologically large agent checklist — the structured rows themselves are
+    /// bounded by the Mac's checklist size cap, so this is a defensive backstop).
+    ///
+    /// `internal` (not `private`) so the byte-cap-preserves-answers behavior is
+    /// testable without a live transport.
+    nonisolated static func cappedAnswersJSONString(_ answersJSON: Data?, maxBytes: Int) -> String? {
+        guard let answersJSON else { return nil }
+        if answersJSON.count <= maxBytes {
+            return String(data: answersJSON, encoding: .utf8)
+        }
+        // Over the cap: the note is the only unbounded field. Re-encode keeping
+        // the MC answers but dropping the note.
+        guard let decoded = try? DogfoodFeedbackAnswers.decode(answersJSON) else { return nil }
+        let noteFree = DogfoodFeedbackAnswers(answers: decoded.answers, note: "")
+        guard let reEncoded = try? noteFree.encode(), reEncoded.count <= maxBytes else { return nil }
+        return String(data: reEncoded, encoding: .utf8)
+    }
+
+    // MARK: - Dogfood checklist (P2)
+
+    #if DEBUG
+    /// The event topic the Mac pushes agent checklists on.
+    nonisolated private static let dogfoodChecklistTopic = "dogfood.checklist"
+    /// The capability the Mac advertises when it can push/serve checklists. A
+    /// P1-only Mac omits it, so the phone skips the subscribe + fetch and never
+    /// eats a `method_not_found`.
+    nonisolated private static let dogfoodChecklistCapability = "dogfood.checklist"
+
+    /// Inject the floating pane's model so the dedicated checklist subscription
+    /// can feed it. Called once from the composition root after both are built.
+    /// - Parameter model: The DEV dogfood pane model.
+    public func setDogfoodFeedbackModel(_ model: DogfoodFeedbackModel) {
+        dogfoodFeedbackModel = model
+    }
+
+    private var dogfoodChecklistStreamID: String {
+        "ios-dogfood-checklist-\(clientID)"
+    }
+
+    /// Start the dedicated, durable ``dogfood.checklist`` subscription for the
+    /// active connection, then pull the current checklist once so a checklist the
+    /// agent pushed *before* this device subscribed is not missed (the
+    /// subscribe-after-push race).
+    ///
+    /// This is intentionally separate from ``startTerminalRefreshPolling()``: the
+    /// terminal stream is re-subscribed every ~9s by the render-grid liveness
+    /// watchdog, which would repeatedly drop a topic piggybacked on it. A
+    /// dedicated stream_id + listener coexists with the terminal stream (both the
+    /// client session and the Mac host demux subscriptions by topic / stream_id).
+    private func startDogfoodChecklistSubscription() {
+        guard let client = remoteClient else { return }
+        guard runtime?.supportsServerPushEvents ?? true else { return }
+        guard dogfoodChecklistListenerTask == nil else { return }
+        let topics: Set<String> = [Self.dogfoodChecklistTopic]
+        dogfoodChecklistListenerTask = Task { @MainActor [weak self] in
+            defer { self?.dogfoodChecklistListenerTask = nil }
+            guard let self else { return }
+            // Gate on the Mac advertising the capability so a P1-only Mac is a
+            // no-op (no subscribe, no fetch). The capability check reuses the
+            // host status the terminal path already resolves.
+            guard await self.macAdvertisesDogfoodChecklist(client: client) else { return }
+            let stream = await client.subscribe(to: topics)
+            let subscribed = await self.requestDogfoodChecklistSubscription(client: client)
+            guard subscribed else { return }
+            // Close the subscribe-after-push race: pull the current checklist now.
+            await self.fetchDogfoodChecklist(client: client)
+            for await event in stream {
+                guard !Task.isCancelled else { return }
+                guard self.remoteClient === client else { return }
+                if event.topic == Self.dogfoodChecklistTopic {
+                    self.dogfoodFeedbackModel?.applyChecklistPayload(event.payloadJSON)
+                }
+            }
+        }
+    }
+
+    private func stopDogfoodChecklistSubscription() {
+        dogfoodChecklistListenerTask?.cancel()
+        dogfoodChecklistListenerTask = nil
+    }
+
+    /// Whether the connected Mac advertises the dogfood-checklist capability.
+    private func macAdvertisesDogfoodChecklist(client: MobileCoreRPCClient) async -> Bool {
+        do {
+            let data = try await client.sendRequest(
+                MobileCoreRPCClient.requestData(method: "mobile.host.status", params: [:]),
+                timeoutNanoseconds: Self.terminalOutputCapabilityTimeoutNanoseconds
+            )
+            guard let payload = try? MobileHostStatusResponse.decode(data) else { return false }
+            return payload.capabilities.contains(Self.dogfoodChecklistCapability)
+        } catch {
+            return false
+        }
+    }
+
+    /// Register the dedicated checklist subscription with the Mac host. Uses a
+    /// distinct stream_id so it coexists with the terminal subscription.
+    private func requestDogfoodChecklistSubscription(client: MobileCoreRPCClient) async -> Bool {
+        do {
+            let requestData = try MobileCoreRPCClient.requestData(
+                method: "mobile.events.subscribe",
+                params: [
+                    "stream_id": dogfoodChecklistStreamID,
+                    "topics": [Self.dogfoodChecklistTopic],
+                ]
+            )
+            let responseData = try await client.sendRequest(requestData)
+            let response = try? MobileEventSubscribeResponse.decode(responseData)
+            return !(response?.streamID ?? "").isEmpty
+        } catch {
+            mobileShellLog.error("dogfood checklist subscribe failed: \(String(describing: error), privacy: .public)")
+            return false
+        }
+    }
+
+    /// Pull the current checklist via `dogfood.checklist.fetch` and feed it to the
+    /// pane model. Best-effort: a missing/old Mac or an unparseable result is a
+    /// no-op (the subscription still delivers future pushes). A result that
+    /// explicitly reports no checklist (`{"checklist": null}`) clears the pane —
+    /// this is the reconnect/missed-clear recovery path, so a phone that still
+    /// shows a since-cleared checklist gets cleared on the next fetch.
+    private func fetchDogfoodChecklist(client: MobileCoreRPCClient) async {
+        do {
+            let data = try await client.sendRequest(
+                MobileCoreRPCClient.requestData(method: "dogfood.checklist.fetch", params: [:])
+            )
+            switch Self.dogfoodChecklistFetchResult(from: data) {
+            case .present(let payload):
+                dogfoodFeedbackModel?.applyChecklistPayload(payload)
+            case .cleared:
+                dogfoodFeedbackModel?.applyChecklist(.empty)
+            case .unparseable:
+                break
+            }
+        } catch {
+            mobileShellLog.error("dogfood checklist fetch failed: \(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// The three outcomes of parsing a `dogfood.checklist.fetch` result.
+    private enum DogfoodChecklistFetchResult {
+        /// A checklist object was present; carries its re-serialized JSON.
+        case present(Data)
+        /// The Mac explicitly reported no checklist (`{"checklist": null}`).
+        case cleared
+        /// The result could not be parsed; the caller should leave state as-is.
+        case unparseable
+    }
+
+    /// Classify a `dogfood.checklist.fetch` result.
+    ///
+    /// ``MobileCoreRPCClient/sendRequest(_:timeoutNanoseconds:)`` already unwraps
+    /// the JSON-RPC envelope and returns only the `result` object, so the data
+    /// here is `{"checklist": {...}}` (a checklist) or `{"checklist": null}` (no
+    /// checklist), not a nested `{"result": …}`. A present `checklist` object is
+    /// re-serialized for the typed decoder; an explicit `null` (or absent key on
+    /// a well-formed result) is a `cleared` signal; anything else is
+    /// `unparseable`.
+    nonisolated private static func dogfoodChecklistFetchResult(from data: Data) -> DogfoodChecklistFetchResult {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return .unparseable
+        }
+        if let checklist = root["checklist"] as? [String: Any],
+           let reSerialized = try? JSONSerialization.data(withJSONObject: checklist) {
+            return .present(reSerialized)
+        }
+        // A well-formed result whose `checklist` is null/absent means the Mac has
+        // no checklist set: clear the pane.
+        return .cleared
     }
 
     // MARK: - Feedback routing
@@ -1041,6 +1432,177 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             mobileShellLog.error("feedback email submit failed error=\(String(describing: error), privacy: .public)")
             return .failed
         }
+    }
+
+    // MARK: - Feedback routing
+
+    /// An all-empty stamp used when no app-layer provider is injected (previews /
+    /// tests). A real build always injects a populated provider at the
+    /// composition root.
+    public static let emptyFeedbackStamp = MobileFeedbackStamp(
+        buildType: .prod,
+        appVersion: "",
+        appBuild: "",
+        bundleIdentifier: "",
+        osVersion: "",
+        deviceModel: ""
+    )
+
+    /// The signed-in user's primary email, read through the identity seam.
+    ///
+    /// Used by the Send Feedback affordance to decide the route (privileged vs
+    /// email) and to prefill the reply-to address on the email path.
+    public var signedInUserEmail: String? {
+        identityProvider?.currentUserEmail
+    }
+
+    /// Whether the device currently has an active mobile-host connection to a
+    /// paired Mac — the implementable "on the tailnet" proxy used by feedback
+    /// routing, since that transport runs over Tailscale.
+    public var hasActiveMacConnection: Bool {
+        connectionState == .connected && remoteClient != nil
+    }
+
+    /// Where a Send Feedback submission should be delivered right now.
+    ///
+    /// Pure decision over the current email + connection state; the privileged
+    /// direct-to-agent route is offered only to `@manaflow.ai` users on an
+    /// active connection, everyone else routes to the email inbox.
+    public var currentFeedbackRoute: MobileFeedbackRoute {
+        resolveMobileFeedbackRoute(
+            email: signedInUserEmail,
+            hasActiveMacConnection: hasActiveMacConnection,
+            hostSupportsAgentSink: supportsDogfoodFeedback
+        )
+    }
+
+    /// The current build + device stamp, resolved through the injected provider.
+    public var currentFeedbackStamp: MobileFeedbackStamp {
+        feedbackStampProvider()
+    }
+
+    /// Outcome of a Send Feedback submission, including which route was taken so
+    /// the UI can word its confirmation ("sent to the agent" vs "emailed").
+    public enum FeedbackSubmissionOutcome: Equatable, Sendable {
+        /// The rich diagnostic bundle was delivered to the paired Mac.
+        case sentToAgent
+        /// The message was emailed to the feedback inbox.
+        case emailed
+        /// Delivery failed; the UI should surface an error and let the user retry.
+        case failed
+    }
+
+    /// The single Send Feedback entrypoint. Routes the submission to the
+    /// privileged direct-to-agent bundle or the email inbox per
+    /// ``currentFeedbackRoute``, stamping the build + device on both paths.
+    ///
+    /// One mutation path so every surface (the menu affordance, and any future
+    /// entrypoint) shares the same routing, stamping, and delivery rather than
+    /// duplicating it.
+    ///
+    /// - Parameters:
+    ///   - message: The freeform feedback body.
+    ///   - emailOverride: The reply-to email when the user edited it on the email
+    ///     path; defaults to the signed-in email.
+    ///   - debugLogText: The string debug-log snapshot, used only on the agent
+    ///     path.
+    ///   - terminalText: The visible terminal text, used only on the agent path.
+    /// - Returns: The outcome (which route succeeded, or `.failed`).
+    @discardableResult
+    public func submitFeedback(
+        message: String,
+        emailOverride: String? = nil,
+        debugLogText: String,
+        terminalText: String
+    ) async -> FeedbackSubmissionOutcome {
+        let stamp = currentFeedbackStamp
+        switch currentFeedbackRoute {
+        case .privilegedAgent:
+            let ok = await submitPrivilegedAgentFeedback(
+                text: message,
+                debugLogText: debugLogText,
+                terminalText: terminalText,
+                buildStamp: stamp.agentBuildStamp
+            )
+            if ok {
+                return .sentToAgent
+            }
+            // The agent sink failed (e.g. the Mac rejected the privileged sink,
+            // or the RPC could not be delivered). Fall back to the email inbox
+            // rather than dead-ending, so the report is still delivered. Any
+            // valid reply-to works; we have the signed-in email here.
+            mobileShellLog.error("privileged agent feedback failed; falling back to email")
+            return await submitFeedbackEmail(message: message, emailOverride: emailOverride, stamp: stamp)
+        case .email:
+            return await submitFeedbackEmail(message: message, emailOverride: emailOverride, stamp: stamp)
+        }
+    }
+
+    /// Email the feedback inbox, returning `.emailed` on success and `.failed`
+    /// when the submitter is unavailable or the POST fails. Shared by the email
+    /// route and the privileged-agent fallback so both deliver identically.
+    private func submitFeedbackEmail(
+        message: String,
+        emailOverride: String?,
+        stamp: MobileFeedbackStamp
+    ) async -> FeedbackSubmissionOutcome {
+        guard let submitter = feedbackEmailSubmitter else {
+            mobileShellLog.error("feedback email submitter unavailable")
+            return .failed
+        }
+        let email = (emailOverride ?? signedInUserEmail ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        do {
+            try await submitter.submit(email: email, message: message, stamp: stamp)
+            return .emailed
+        } catch {
+            mobileShellLog.error("feedback email submit failed error=\(String(describing: error), privacy: .public)")
+            return .failed
+        }
+    }
+
+    // MARK: - Notification dismiss-sync
+
+    /// Tell the Mac that one or more mirrored notifications were dismissed on
+    /// this phone (a swipe/clear on the delivered banner). The Mac marks them
+    /// read and clears its own banner; its store then emits `notification.dismissed`
+    /// back, which is a harmless no-op for the already-removed phone banner.
+    ///
+    /// Fire-and-forget against the authoritative Mac store. Carries only opaque
+    /// notification UUIDs, never terminal content, so it is safe regardless of
+    /// the Mac's phone-forward hideContent setting.
+    /// - Parameter ids: The stable notification ids the user dismissed.
+    public func dismissNotification(ids: [String]) async {
+        let trimmed = ids
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmed.isEmpty, let client = remoteClient else { return }
+        do {
+            let request = try MobileCoreRPCClient.requestData(
+                method: "notification.dismiss",
+                params: [
+                    "notification_ids": trimmed,
+                    "client_id": clientID,
+                ]
+            )
+            _ = try await client.sendRequest(request)
+        } catch {
+            mobileShellLog.error("notification dismiss sync failed count=\(trimmed.count, privacy: .public) error=\(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Clear delivered banners on this phone in response to a Mac-side dismiss
+    /// (`notification.dismissed` peer event). The stable notification id was sent
+    /// to APNs as the `apns-collapse-id`, so the delivered remote notification's
+    /// `request.identifier` equals that id, which is what the injected
+    /// ``DeliveredNotificationClearing`` seam matches on.
+    /// - Parameter ids: The notification ids the Mac dismissed.
+    public func clearDeliveredNotifications(ids: [String]) {
+        let trimmed = ids
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmed.isEmpty else { return }
+        deliveredNotificationClearer.removeDelivered(ids: trimmed)
     }
 
     // MARK: - Network recovery
@@ -1710,6 +2272,13 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         // supersedes it via `beginPairingAttempt`, leaving `connectionState`
         // `.connected` for the other Mac; matching the live route prevents this
         // superseded task from persisting a stale active target.
+        //
+        // Route equality is the only reliable signal here: `connectManualHost`
+        // mints a synthetic `manual-<host>:<port>` ticket id (see
+        // `manualHostTicket`), so `activeTicket?.macDeviceID` cannot reconcile
+        // against the real stored Mac id. A host:port that has been reassigned to
+        // a different Mac is an unhandleable manual-reconnect limitation shared
+        // with `reconnectActiveMacIfAvailable`, not specific to switching.
         if connectionState == .connected,
            case let .hostPort(liveHost, livePort)? = activeRoute?.endpoint,
            liveHost == normalizedHost, livePort == port {
@@ -1743,6 +2312,50 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             mobileShellLog.error("paired mac store remove failed mac=\(macDeviceID, privacy: .public) error=\(String(describing: error), privacy: .public)")
         }
         await loadPairedMacs()
+    }
+
+    /// Pair another Mac from a scanned QR/link without stranding the current
+    /// session, for the "Pair Another Mac" action in the host switcher.
+    ///
+    /// ``connectPairingURL(_:)`` is destructive: it begins a fresh pairing
+    /// attempt that replaces/clears the live remote client during connect, so a
+    /// stale, expired, or offline code would otherwise tear down a working
+    /// session. Mirroring ``switchToMac(macDeviceID:)``, if there was a live
+    /// connection that failed to move to the new Mac, the previously-active Mac
+    /// is reconnected so the user is not dropped on a bad scan. The host picker
+    /// should dismiss only when this returns `true`.
+    /// - Parameter rawValue: The scanned pairing URL/code.
+    /// - Returns: `true` only when the new Mac connected; `false` on a failed or
+    ///   superseded attempt (the picker stays open).
+    @discardableResult
+    public func pairAdditionalMac(_ rawValue: String) async -> Bool {
+        // The session to fall back to if the new pairing fails to connect.
+        let hadLiveConnection = connectionState == .connected
+        // Capture the scoped Stack user id *before* the destructive connect. The
+        // failure fallback must reconnect only within this user's pairings, never
+        // via `activeMac(stackUserID: nil)`, which is the store's all-users query
+        // and could reconnect another Stack user's Mac on a shared device.
+        let fallbackStackUserID = identityProvider?.currentUserID
+        let result = await connectPairingURLResult(rawValue)
+        switch result {
+        case .connected:
+            await loadPairedMacs()
+            return true
+        case .superseded:
+            // Another pairing/switch attempt took over; leave its state intact.
+            return false
+        case .failed:
+            // The destructive connect path dropped the previous session; if we
+            // had one and still have a scoped identity, reconnect the still-active
+            // stored Mac so the user is not left disconnected after a bad scan. No
+            // scoped identity means no safe reconnect target, so we skip it rather
+            // than fall into the unscoped all-users lookup.
+            if hadLiveConnection, let fallbackStackUserID {
+                _ = await reconnectActiveMacIfAvailable(stackUserID: fallbackStackUserID)
+            }
+            await loadPairedMacs()
+            return false
+        }
     }
 
     static func firstReconnectHostPortRoute(
@@ -2144,6 +2757,16 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         setSelectedWorkspaceID(id)
     }
 
+    /// Explicitly open a workspace (notification tap / deep-link), selecting it
+    /// and signalling the compact shell to push its detail even from the root
+    /// list. The monotonic token makes a repeat request for the already-selected
+    /// workspace still fire an `onChange`.
+    public func requestOpenWorkspace(_ id: MobileWorkspacePreview.ID) {
+        setSelectedWorkspaceID(id)
+        workspaceOpenRequestCounter += 1
+        pendingWorkspaceOpenRequest = (id: id, token: workspaceOpenRequestCounter)
+    }
+
     public func sendTerminalInput() {
         Task { @MainActor [weak self] in
             await self?.submitTerminalInput()
@@ -2444,6 +3067,43 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         await sendRemoteTerminalInput(text, workspaceID: workspaceID, terminalID: terminalID)
     }
 
+    /// Send a committed block of text (system dictation, an autocorrect
+    /// replacement, or keyboard-inserted clipboard text) to the terminal that
+    /// owns `surfaceID` as a *bracketed paste*.
+    ///
+    /// Unlike ``submitTerminalRawInput(_:surfaceID:)``, this routes to the
+    /// Mac's `terminal.paste` RPC, which delivers the text through Ghostty's
+    /// paste path (`ghostty_surface_text`). That keeps embedded newlines part of
+    /// one paste so a running shell or TUI does not execute each line as a
+    /// separate command, and lets bracketed-paste-aware programs treat it as
+    /// pasted content.
+    /// - Parameters:
+    ///   - text: The committed block. Sent verbatim; the Mac applies bracketed
+    ///     paste framing.
+    ///   - surfaceID: The terminal surface id the block targets.
+    public func submitTerminalPasteText(_ text: String, surfaceID: String) async {
+        guard !text.isEmpty else { return }
+        let workspaceCandidate = workspaces.first(where: { workspace in
+            workspace.terminals.contains(where: { $0.id.rawValue == surfaceID })
+        })
+        guard let workspace = workspaceCandidate else { return }
+        guard remoteClient != nil else { return }
+        let terminalID = MobileTerminalPreview.ID(rawValue: surfaceID)
+        // Fall back to per-key input when the paired Mac is too old to advertise
+        // the bracketed-paste RPC, so a new client + old host drops nothing.
+        // `terminal.input` expects CR for Return, so normalize newlines.
+        guard supportsTerminalPaste else {
+            let normalized = text.replacingOccurrences(of: "\n", with: "\r")
+            await submitTerminalRawInput(normalized, workspaceID: workspace.id, terminalID: terminalID)
+            return
+        }
+        await sendRemoteTerminalPasteText(
+            text,
+            workspaceID: workspace.id,
+            terminalID: terminalID
+        )
+    }
+
     private func drainRawTerminalInputBuffer() async {
         while let chunk = rawTerminalInputBuffer.nextBatch() {
             await submitTerminalRawInput(
@@ -2709,6 +3369,14 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     private func replaceRemoteClient(with newValue: MobileCoreRPCClient?) {
         let previous = remoteClient
         remoteClient = newValue
+        if previous !== newValue {
+            // The notification feed is per-Mac. Dropping or swapping the client
+            // (sign-out, forget, reauth failure, Mac switch) must clear the
+            // mirror so the Notifications tab never shows the previous Mac's
+            // titles/bodies. A fresh connection's cold-attach fetch repopulates
+            // it; an older Mac with no notifications hub leaves it empty.
+            notificationsStore.apply([])
+        }
         if let previous, previous !== newValue {
             Task { await previous.disconnect() }
         }
@@ -2727,6 +3395,8 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         workspaceListRefreshTask = nil
         pullToRefreshTask?.cancel()
         pullToRefreshTask = nil
+        notificationsRefreshTask?.cancel()
+        notificationsRefreshTask = nil
     }
 
     private func resetTerminalOutputTracking() {
@@ -2735,7 +3405,11 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         terminalReplaySurfaceIDsInFlight = []
         terminalOutputTransport = .rawBytes
         supportsWorkspaceActions = false
+        // Clear paste support too, so a reconnect to an older host cannot send
+        // `terminal.paste` on a stale `true` before the next status probe lands.
+        supportsTerminalPaste = false
         supportsDogfoodFeedback = false
+        supportsWorkspaceGroups = false
         terminalSubscriptionRefreshTask?.cancel()
         terminalSubscriptionRefreshTask = nil
         stopRenderGridLivenessWatchdog(listenerID: nil)
@@ -3380,6 +4054,96 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             handleTerminalInputResponse(responseData, surfaceID: terminalID.rawValue)
         } catch {
             guard generation == connectionGeneration else { return }
+            // An oversized image is a paste problem, not a connection problem:
+            // route it to the transient paste notice instead of tearing down or
+            // showing the connection-recovery banner.
+            if Self.isPasteImageTooLargeError(error) {
+                setPasteImageTooLargeNotice()
+                return
+            }
+            guard !disconnectForAuthorizationFailureIfNeeded(error) else { return }
+            markMacConnectionUnavailableIfNeeded(after: error)
+            applyOperationalError(error)
+        }
+    }
+
+    /// Whether `error` means a pasted image was rejected for being too large,
+    /// either locally (the base64 JSON overflowed the sync frame cap) or by the
+    /// Mac (its 10 MB clipboard-image cap, surfaced as an `invalid_params`
+    /// RPC error from `terminal.paste_image`).
+    private static func isPasteImageTooLargeError(_ error: any Error) -> Bool {
+        if case MobileSyncFrameCodecError.frameTooLarge = error {
+            return true
+        }
+        if let connectionError = error as? MobileShellConnectionError,
+           case let .rpcError(_, message) = connectionError,
+           message.localizedCaseInsensitiveContains("size limit") {
+            return true
+        }
+        return false
+    }
+
+    /// Surface the "image too large" notice triggered by the iOS-side size check,
+    /// before any frame is sent (every encoding overflowed the frame budget).
+    public func reportPasteImageTooLarge() {
+        setPasteImageTooLargeNotice()
+    }
+
+    /// Clear the transient paste-image notice (e.g. when its toast auto-dismisses
+    /// or the user taps it away).
+    public func dismissPasteImageNotice() {
+        pasteImageNotice = nil
+    }
+
+    /// Single setter for the too-large notice so the iOS-side pre-send check and
+    /// the Mac-side RPC rejection both surface identical, localized feedback.
+    private func setPasteImageTooLargeNotice() {
+        pasteImageNotice = L10n.string(
+            "mobile.paste.imageTooLarge",
+            defaultValue: "Image is too large to paste. Try a smaller image."
+        )
+        pasteImageNoticeToken &+= 1
+    }
+
+    /// Deliver a committed text block (system dictation, an autocorrect/predictive
+    /// replacement, or keyboard-inserted clipboard text) to the Mac surface as a
+    /// bracketed paste *without* submitting. Routes through the same canonical
+    /// `terminal.paste` RPC as the composer, passing `submit_key: "none"` so the
+    /// host inserts the block verbatim and leaves the cursor in place (no Return),
+    /// matching the per-key input behavior the keyboard would otherwise produce.
+    private func sendRemoteTerminalPasteText(
+        _ text: String,
+        workspaceID: MobileWorkspacePreview.ID,
+        terminalID: MobileTerminalPreview.ID
+    ) async {
+        guard let client = remoteClient else { return }
+        let generation = connectionGeneration
+        do {
+            #if DEBUG
+            mobileShellLog.debug("send remote terminal paste text byteCount=\(text.utf8.count, privacy: .public) workspace=\(workspaceID.rawValue, privacy: .private) terminal=\(terminalID.rawValue, privacy: .private)")
+            #endif
+            let key = viewportKey(workspaceID: workspaceID, terminalID: terminalID)
+            var params: [String: Any] = [
+                "workspace_id": workspaceID.rawValue,
+                "surface_id": terminalID.rawValue,
+                "text": text,
+                "submit_key": "none",
+                "client_id": clientID,
+            ]
+            if let viewportSize = reportedViewportSizesByTerminalKey[key] {
+                params["viewport_columns"] = viewportSize.columns
+                params["viewport_rows"] = viewportSize.rows
+            }
+            let responseData = try await client.sendRequest(
+                MobileCoreRPCClient.requestData(
+                    method: "terminal.paste",
+                    params: params
+                )
+            )
+            guard isCurrentRemoteOperation(client: client, generation: generation) else { return }
+            handleTerminalInputResponse(responseData, surfaceID: terminalID.rawValue)
+        } catch {
+            guard generation == connectionGeneration else { return }
             guard !disconnectForAuthorizationFailureIfNeeded(error) else { return }
             markMacConnectionUnavailableIfNeeded(after: error)
             applyOperationalError(error)
@@ -3443,11 +4207,15 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             guard let payload = try? MobileHostStatusResponse.decode(data) else {
                 terminalOutputTransport = fallback
                 supportsWorkspaceActions = false
+                supportsTerminalPaste = false
                 supportsDogfoodFeedback = false
+                supportsWorkspaceGroups = false
                 return fallback
             }
             supportsWorkspaceActions = payload.capabilities.contains(Self.workspaceActionsCapability)
+            supportsTerminalPaste = payload.capabilities.contains(Self.terminalPasteCapability)
             supportsDogfoodFeedback = payload.capabilities.contains(Self.dogfoodFeedbackCapability)
+            supportsWorkspaceGroups = payload.capabilities.contains(Self.workspaceGroupsCapability)
             let transport: TerminalOutputTransport = payload.capabilities.contains(Self.terminalRenderGridCapability) ||
                 payload.terminalFidelity == "render_grid" ? .renderGrid : .rawBytes
             terminalOutputTransport = transport
@@ -3456,7 +4224,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         } catch {
             terminalOutputTransport = fallback
             supportsWorkspaceActions = false
+            supportsTerminalPaste = false
             supportsDogfoodFeedback = false
+            supportsWorkspaceGroups = false
             MobileDebugLog.anchormux("sync.transport=raw_bytes reason=status_failed")
             return fallback
         }
@@ -3481,6 +4251,12 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     private func startTerminalRefreshPolling() {
         guard let client = remoteClient else { return }
         guard runtime?.supportsServerPushEvents ?? true else { return }
+        #if DEBUG
+        // Arm the dedicated, durable dogfood-checklist subscription alongside the
+        // terminal stream (its own task + stream_id, so the render-grid liveness
+        // watchdog's re-subscribe never drops it). Idempotent.
+        startDogfoodChecklistSubscription()
+        #endif
         guard terminalEventListenerTask == nil else { return }
         let listenerID = UUID()
         terminalEventListenerID = listenerID
@@ -3520,6 +4296,10 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                 return
             }
             self?.markMacConnectionHealthy()
+            // Cold-attach snapshot: pull the recent notification feed once the
+            // subscription is live, the same way the workspace list is fetched on
+            // connect. Live updates then arrive via `notifications.updated`.
+            self?.scheduleNotificationsRefreshFromEvent()
             MobileDebugLog.anchormux("sync.subscribe_ok topics=\(topics.count) transport=\(outputTransport)")
             // Keep the listener alive without keeping the shell store alive.
             for await event in stream {
@@ -3532,6 +4312,14 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                 self.markMacConnectionHealthy()
                 if event.topic == "workspace.updated" {
                     self.scheduleWorkspaceListRefreshFromEvent()
+                    // The notification feed rows carry `workspace_name`, which
+                    // comes from the same workspace metadata. A rename/close fires
+                    // `workspace.updated` (not `notifications.updated`, whose hash
+                    // omits the label), so refresh the feed too to keep row labels
+                    // current.
+                    self.scheduleNotificationsRefreshFromEvent()
+                } else if event.topic == "notifications.updated" {
+                    self.scheduleNotificationsRefreshFromEvent()
                 } else if event.topic == "terminal.render_grid" {
                     self.handleTerminalRenderGridEvent(event)
                 } else if event.topic == "terminal.bytes" {
@@ -3539,6 +4327,10 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                     // pty-tee. This is the compatibility fallback when the Mac
                     // host does not advertise `terminal.render_grid.v1`.
                     self.handleTerminalBytesEvent(event)
+                } else if event.topic == "notification.dismissed" {
+                    // The Mac dismissed/cleared notifications; clear the matching
+                    // mirrored banners on this phone.
+                    self.handleNotificationDismissedEvent(event)
                 }
             }
             guard let self else { return }
@@ -3763,6 +4555,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         terminalByteContinuationsBySurfaceID.removeValue(forKey: surfaceID)
         deliveredTerminalByteEndSeqBySurfaceID.removeValue(forKey: surfaceID)
         pendingTerminalByteEndSeqBySurfaceID.removeValue(forKey: surfaceID)
+        terminalScrolledUpBySurfaceID.removeValue(forKey: surfaceID)
         // Tell the Mac this device is no longer viewing the surface so it stops
         // pinning the shared grid to our viewport and clears the macOS border.
         clearTerminalViewport(surfaceID: surfaceID)
@@ -3961,6 +4754,14 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             )
             return
         }
+        // Track the authoritative viewport position the Mac stamped on this
+        // (non-stale) frame so the floating jump-to-bottom button shows only
+        // when the user has scrolled up. Updated even when the patch is empty
+        // (a pure scroll can produce a delta with no cell changes).
+        ingestTerminalScrolledUpSignal(
+            surfaceID: renderGrid.surfaceID,
+            scrolledUp: renderGrid.hasRoomToScrollToBottom
+        )
         let bytes = renderGrid.vtPatchBytes()
         markTerminalBytesDelivered(surfaceID: renderGrid.surfaceID, endSeq: renderGrid.stateSeq)
         #if DEBUG
@@ -3968,6 +4769,17 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         #endif
         guard !bytes.isEmpty else { return }
         deliverTerminalBytes(bytes, surfaceID: renderGrid.surfaceID)
+    }
+
+    private func handleNotificationDismissedEvent(_ event: MobileEventEnvelope) {
+        guard
+            let json = event.payloadJSON,
+            let payload = MobileNotificationDismissedEvent.decode(json),
+            !payload.ids.isEmpty
+        else {
+            return
+        }
+        clearDeliveredNotifications(ids: payload.ids)
     }
 
     private func handleTerminalBytesEvent(_ event: MobileEventEnvelope) {
@@ -4032,6 +4844,73 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         }
     }
 
+    /// Refetch the notification feed and mirror it into `notificationsStore`.
+    ///
+    /// Mirrors `scheduleWorkspaceListRefreshFromEvent`: the Mac emits an
+    /// empty-payload `notifications.updated` signal, the phone pulls the recent
+    /// list via `mobile.notifications.list` and replaces its mirror. Called both
+    /// on the live event and once on connect so a cold attach gets a snapshot.
+    func scheduleNotificationsRefreshFromEvent() {
+        guard let client = remoteClient else { return }
+        notificationsRefreshTask?.cancel()
+        notificationsRefreshTask = Task { @MainActor [weak self] in
+            defer { self?.notificationsRefreshTask = nil }
+            guard let self else { return }
+            do {
+                let request = try MobileCoreRPCClient.requestData(method: "mobile.notifications.list", params: [:])
+                let data = try await client.sendRequest(request)
+                let response = try MobileNotificationsListResponse.decode(data)
+                // Guard on client identity only, NOT `connectionState == .connected`.
+                // The cold-attach fetch is kicked from `startTerminalRefreshPolling`
+                // which runs just before the connect path flips the state to
+                // `.connected`; requiring `.connected` here would race-drop the
+                // initial snapshot and leave the feed empty until the next event.
+                // `replaceRemoteClient` clears the store and swaps the client on
+                // teardown, so a stale client's late response is rejected here and
+                // never overwrites a newer connection's feed.
+                guard self.remoteClient === client else { return }
+                self.notificationsStore.apply(response.previews())
+            } catch {
+                // A Mac too old to advertise the verb returns `method_not_found`;
+                // the feed simply stays empty. Best-effort like the workspace
+                // refetch — never disrupt the connection.
+                mobileShellLog.error("notifications refresh failed: \(String(describing: error), privacy: .private)")
+            }
+        }
+    }
+
+    /// Mark a notification read on the phone (optimistic) and propagate the
+    /// read-state to the Mac so it stops re-notifying. The Mac's emit makes every
+    /// connected phone refetch the reconciled state.
+    public func markNotificationRead(id: String) {
+        notificationsStore.markReadLocally(id: id)
+        propagateNotificationMarkRead(params: ["id": id])
+    }
+
+    /// Mark every notification for a workspace read (used on workspace open).
+    public func markNotificationsRead(forWorkspace workspaceID: String) {
+        guard notificationsStore.unreadCount(forWorkspace: workspaceID) > 0 else { return }
+        notificationsStore.markReadLocally(forWorkspace: workspaceID)
+        propagateNotificationMarkRead(params: ["workspace_id": workspaceID])
+    }
+
+    private func propagateNotificationMarkRead(params: [String: Any]) {
+        guard let client = remoteClient, connectionState == .connected else { return }
+        Task { @MainActor in
+            do {
+                let request = try MobileCoreRPCClient.requestData(
+                    method: "mobile.notifications.mark_read",
+                    params: params
+                )
+                _ = try await client.sendRequest(request)
+            } catch {
+                // Optimistic local flip already cleared the badge; a failed
+                // propagation reconciles on the next refetch. Best-effort.
+                mobileShellLog.error("notifications mark_read failed: \(String(describing: error), privacy: .private)")
+            }
+        }
+    }
+
     /// Re-fetch the authoritative workspace list from the connected Mac and apply
     /// it, awaiting the round-trip to completion.
     ///
@@ -4087,7 +4966,12 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         terminalEventListenerTask?.cancel()
         terminalEventListenerTask = nil
         terminalEventListenerID = nil
+        notificationsRefreshTask?.cancel()
+        notificationsRefreshTask = nil
         stopRenderGridLivenessWatchdog(listenerID: nil)
+        #if DEBUG
+        stopDogfoodChecklistSubscription()
+        #endif
     }
 
     private func setSelectedWorkspaceID(_ id: MobileWorkspacePreview.ID?) {
@@ -4112,6 +4996,14 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             workspaces = mergedWorkspaces
         } else {
             workspaces = remoteWorkspaces
+        }
+        // Group sections always reflect the latest full response (never merged):
+        // a merge path is a single-entry create/refresh that omits groups, so
+        // applying its empty groups array would wrongly clear the sections. Only a
+        // full-list response (the non-merge path, which the event-driven refresh
+        // and initial sync use) carries authoritative group state.
+        if !mergeExistingWorkspaces {
+            workspaceGroups = response.groups.map { MobileWorkspaceGroupPreview(remote: $0) }
         }
         if preferActiveTicketTarget, selectActiveTicketTargetIfAvailable() {
             return

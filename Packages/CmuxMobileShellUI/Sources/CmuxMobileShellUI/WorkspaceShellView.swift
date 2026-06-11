@@ -12,7 +12,20 @@ import AppKit
 struct WorkspaceShellView: View {
     @Bindable var store: CMUXMobileShellStore
     let signOut: () -> Void
+    /// Per-workspace unread counts (workspace id raw value → count). Passed in by
+    /// the tab container, which is the snapshot-boundary owner for the
+    /// notifications store, so this list never reads an `@Observable` store.
+    var unreadCountsByWorkspace: [String: Int] = [:]
     @Environment(MobileDisplaySettings.self) private var displaySettings
+    #if os(iOS)
+    /// Owns the observable per-workspace phone-push mute set. Read here so a
+    /// mute/unmute re-renders the workspace list; the set is forwarded into the
+    /// list as a value snapshot (never the store) to respect the `List`
+    /// snapshot boundary. iOS-only: ``MobilePushCoordinator`` (phone push) does
+    /// not exist on macOS, where the workspace list is shown without a mute
+    /// affordance.
+    @Environment(MobilePushCoordinator.self) private var pushCoordinator
+    #endif
     @State private var compactNavigationPath: [MobileWorkspacePreview.ID] = []
     @State private var pendingCompactCreateNavigationWorkspaceIDs: Set<MobileWorkspacePreview.ID>?
     @State private var hasPresentedSplitDetail = false
@@ -51,17 +64,22 @@ struct WorkspaceShellView: View {
         .overlay(alignment: .top) {
             MobileConnectionRecoveryBanner(store: store, signOut: signOut)
         }
+        .overlay(alignment: .bottom) {
+            MobilePasteImageNoticeToast(store: store)
+        }
     }
 
     private var stackLayout: some View {
         NavigationStack(path: $compactNavigationPath) {
             WorkspaceListView(
                 workspaces: store.workspaces,
+                groups: store.workspaceGroups,
                 selectedWorkspaceID: store.selectedWorkspaceID,
                 host: store.connectedHostName,
                 connectionStatus: store.macConnectionStatus,
                 navigationStyle: .push,
                 wrapWorkspaceTitles: displaySettings.wrapWorkspaceTitles,
+                unreadCountsByWorkspace: unreadCountsByWorkspace,
                 selectWorkspace: selectWorkspace,
                 createWorkspace: createWorkspaceInCompactStack,
                 refresh: refreshWorkspacesClosure,
@@ -69,7 +87,10 @@ struct WorkspaceShellView: View {
                 signOut: signOut,
                 store: store,
                 renameWorkspace: renameWorkspaceClosure,
-                setPinned: setWorkspacePinnedClosure
+                setPinned: setWorkspacePinnedClosure,
+                mutedWorkspaceIDs: mutedWorkspaceIDsForList,
+                setMuted: setWorkspaceMutedClosure,
+                toggleGroupCollapsed: toggleGroupCollapsedClosure
             )
             .navigationDestination(for: MobileWorkspacePreview.ID.self) { workspaceID in
                 workspaceDestination(for: workspaceID, createWorkspace: createWorkspaceInCompactStack)
@@ -103,6 +124,20 @@ struct WorkspaceShellView: View {
             compactNavigationPath.removeAll { !workspaceIDs.contains($0) }
             autoOpenSelectedWorkspaceForSoakIfNeeded()
         }
+        // Explicit open requests (notification tap / deep-link) must push the
+        // workspace detail even from the root list, unlike passive selection
+        // changes which the navigation policy intentionally ignores at root.
+        // Observe the monotonic token so a repeat open of the already-selected
+        // workspace still fires.
+        .onChange(of: store.pendingWorkspaceOpenRequest?.token) { _, _ in
+            guard let request = store.pendingWorkspaceOpenRequest,
+                  store.workspaces.contains(where: { $0.id == request.id }) else {
+                return
+            }
+            if compactNavigationPath.last != request.id {
+                compactNavigationPath = [request.id]
+            }
+        }
         .onAppear {
             autoOpenSelectedWorkspaceForSoakIfNeeded()
         }
@@ -112,11 +147,13 @@ struct WorkspaceShellView: View {
         NavigationSplitView(columnVisibility: $splitColumnVisibility) {
             WorkspaceListView(
                 workspaces: store.workspaces,
+                groups: store.workspaceGroups,
                 selectedWorkspaceID: store.selectedWorkspaceID,
                 host: store.connectedHostName,
                 connectionStatus: store.macConnectionStatus,
                 navigationStyle: .sidebar,
                 wrapWorkspaceTitles: displaySettings.wrapWorkspaceTitles,
+                unreadCountsByWorkspace: unreadCountsByWorkspace,
                 selectWorkspace: selectWorkspace,
                 createWorkspace: store.createWorkspace,
                 refresh: refreshWorkspacesClosure,
@@ -124,7 +161,10 @@ struct WorkspaceShellView: View {
                 signOut: signOut,
                 store: store,
                 renameWorkspace: renameWorkspaceClosure,
-                setPinned: setWorkspacePinnedClosure
+                setPinned: setWorkspacePinnedClosure,
+                mutedWorkspaceIDs: mutedWorkspaceIDsForList,
+                setMuted: setWorkspaceMutedClosure,
+                toggleGroupCollapsed: toggleGroupCollapsedClosure
             )
             .navigationSplitViewColumnWidth(min: 320, ideal: 380, max: 440)
         } detail: {
@@ -142,6 +182,11 @@ struct WorkspaceShellView: View {
 
     private func selectWorkspace(_ id: MobileWorkspacePreview.ID) {
         pendingCompactCreateNavigationWorkspaceIDs = nil
+        // Opening a workspace from the list is a read of its activity: clear its
+        // unread notification badge optimistically and propagate the read-state
+        // to the Mac. Same shared mark-read path the Notifications feed uses, so
+        // both entrypoints stay consistent.
+        store.markNotificationsRead(forWorkspace: id.rawValue)
         store.selectedWorkspaceID = id
         if usesCompactStack, compactNavigationPath.last != id {
             compactNavigationPath = [id]
@@ -172,6 +217,46 @@ struct WorkspaceShellView: View {
     private var refreshWorkspacesClosure: @Sendable () async -> Void {
         let store = store
         return { await store.refreshWorkspaces() }
+    }
+
+    /// The muted-workspace snapshot passed into the list. iOS-only (phone push);
+    /// macOS has no `MobilePushCoordinator`, so the list shows no mute state.
+    private var mutedWorkspaceIDsForList: Set<String> {
+        #if os(iOS)
+        pushCoordinator.mutedWorkspaceIDs
+        #else
+        []
+        #endif
+    }
+
+    /// Mute/unmute phone push for a workspace. Phone-local push preference, so
+    /// (unlike pin/rename) it is NOT gated on the Mac's `workspace.actions.v1`
+    /// capability: muting works against any paired Mac. The actual delivery gate
+    /// lives server-side in the web push route. iOS-only: `nil` on macOS, which
+    /// hides the row's mute affordance.
+    private var setWorkspaceMutedClosure: ((MobileWorkspacePreview.ID, Bool) -> Void)? {
+        #if os(iOS)
+        let pushCoordinator = pushCoordinator
+        // Honor the explicit target state from the row's context menu (the menu
+        // passes the state it wants), so a stale row snapshot can't flip mute the
+        // wrong way.
+        return { id, muted in pushCoordinator.setWorkspaceMuted(id.rawValue, muted: muted) }
+        #else
+        return nil
+        #endif
+    }
+
+    /// Group collapse/expand closure. Present when the Mac advertises
+    /// `workspace.groups.v1` or has actually emitted group sections: a Mac that
+    /// emits groups in the workspace list also handles collapse/expand (both
+    /// shipped together), and the capability flag arrives via a separate
+    /// `mobile.host.status` call that can lag or fail without making the
+    /// already-received groups read-only. Older Macs emit no groups, so this
+    /// stays `nil` and the list renders flat.
+    private var toggleGroupCollapsedClosure: ((MobileWorkspaceGroupPreview.ID, Bool) -> Void)? {
+        guard store.supportsWorkspaceGroups || !store.workspaceGroups.isEmpty else { return nil }
+        let store = store
+        return { id, collapsed in Task { await store.setWorkspaceGroupCollapsed(id: id, collapsed) } }
     }
 
     private func createWorkspaceInCompactStack() {

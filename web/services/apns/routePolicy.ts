@@ -6,6 +6,16 @@ export const MAX_PUSH_BODY_CHARS = 500;
 export const MAX_PUSH_ID_CHARS = 200;
 export const MAX_PUSH_REQUEST_BYTES = 8 * 1024;
 
+/// Defensive upper bound on a user's muted-workspace set, mirroring the iOS
+/// `PushRegistrationService.maxMutedWorkspaces`. Bounds the per-user rows the
+/// client will defensively cache/hydrate.
+export const MAX_MUTED_WORKSPACES_PER_USER = 500;
+
+/// Byte cap for a per-workspace mute mutation `POST` body. The body is a single
+/// `{ workspaceId, muted }`, so a small cap (one bounded id + the boolean + JSON
+/// overhead) is plenty; the parser's id-length bound is the real gate.
+export const MAX_MUTE_REQUEST_BYTES = MAX_PUSH_ID_CHARS + 128;
+
 export type ApnsBundlePolicy = {
   readonly bundleId: string;
   readonly environment: "sandbox" | "production";
@@ -17,6 +27,12 @@ export type PushPayload = {
   readonly body: string;
   readonly workspaceId: string | null;
   readonly surfaceId: string | null;
+  /**
+   * Stable Mac-side notification id. Sent to APNs as `apns-collapse-id` and as
+   * `cmux.notificationId` so cross-device dismiss-sync can target the exact
+   * delivered banner. An opaque id, never terminal content.
+   */
+  readonly notificationId: string | null;
   readonly hideContent: boolean;
 };
 
@@ -27,6 +43,15 @@ export type PushPayloadResult =
 export type JsonObjectResult =
   | { readonly ok: true; readonly value: Record<string, unknown> }
   | { readonly ok: false; readonly error: "invalid_json" | "request_too_large" };
+
+export type MuteMutation = {
+  readonly workspaceId: string;
+  readonly muted: boolean;
+};
+
+export type MuteMutationResult =
+  | { readonly ok: true; readonly value: MuteMutation }
+  | { readonly ok: false; readonly error: string };
 
 const DEV_TAGGED_BUNDLE_ID = /^dev\.cmux\.ios\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const PROD_BUNDLE_IDS = new Set(["com.cmuxterm.app", "dev.cmux.app.beta"]);
@@ -58,12 +83,14 @@ export function parsePushPayload(body: Record<string, unknown>): PushPayloadResu
   const text = boundedString(body.body, MAX_PUSH_BODY_CHARS);
   const workspaceId = body.workspaceId == null ? "" : boundedString(body.workspaceId, MAX_PUSH_ID_CHARS);
   const surfaceId = body.surfaceId == null ? "" : boundedString(body.surfaceId, MAX_PUSH_ID_CHARS);
+  const notificationId = body.notificationId == null ? "" : boundedString(body.notificationId, MAX_PUSH_ID_CHARS);
 
   if (title == null) return { ok: false, error: "title_too_long" };
   if (subtitle == null) return { ok: false, error: "subtitle_too_long" };
   if (text == null) return { ok: false, error: "body_too_long" };
   if (workspaceId == null) return { ok: false, error: "workspace_id_too_long" };
   if (surfaceId == null) return { ok: false, error: "surface_id_too_long" };
+  if (notificationId == null) return { ok: false, error: "notification_id_too_long" };
   if (!title && !text) return { ok: false, error: "empty_notification" };
 
   return {
@@ -74,9 +101,33 @@ export function parsePushPayload(body: Record<string, unknown>): PushPayloadResu
       body: text,
       workspaceId: workspaceId || null,
       surfaceId: surfaceId || null,
+      notificationId: notificationId || null,
       hideContent: body.hideContent === true,
     },
   };
+}
+
+/// Parse a single per-workspace mute mutation `POST` (`{ workspaceId, muted }`).
+/// One add/remove per request keeps multiple devices on the same account from
+/// clobbering each other (no full-set replace from a stale local cache).
+export function parseMuteMutationPayload(body: Record<string, unknown>): MuteMutationResult {
+  const workspaceId = boundedString(body.workspaceId, MAX_PUSH_ID_CHARS);
+  if (workspaceId == null) return { ok: false, error: "workspace_id_too_long" };
+  if (!workspaceId) return { ok: false, error: "workspace_id_required" };
+  if (typeof body.muted !== "boolean") return { ok: false, error: "muted_not_boolean" };
+  return { ok: true, value: { workspaceId, muted: body.muted } };
+}
+
+/// Pure delivery decision: `true` when a push for `workspaceId` should be sent,
+/// given the user's muted-workspace set. A `null`/empty workspace id is never
+/// muted (it cannot match a stored id), so it always delivers. Mirrors the iOS
+/// `pushShouldDeliver`.
+export function shouldDeliverToWorkspace(
+  workspaceId: string | null,
+  mutedWorkspaceIds: ReadonlySet<string>,
+): boolean {
+  if (!workspaceId) return true;
+  return !mutedWorkspaceIds.has(workspaceId);
 }
 
 export async function readBoundedJsonObject(

@@ -9,11 +9,21 @@
 /// ``DiagnosticEventCode/composerKeyboardToggleWhilePresented`` events so a
 /// captured trace shows *which* view actually holds first responder when the
 /// composer opens, closes, or survives a keyboard toggle.
+/// The keyboard-input instrumentation stamps this into the `a`/`b` slots of the
+/// ``DiagnosticEventCode/inputKeyboardUp``, ``DiagnosticEventCode/inputDeleteBackward``,
+/// and ``DiagnosticEventCode/inputBecomeFirstResponder`` events so a device
+/// dogfood reveals *which* view the software keyboard actually drives.
+///
+/// The central question this answers: is ``DiagnosticEventCode/inputDeleteBackward``
+/// firing on the same view the keyboard came up over, or has first responder
+/// moved elsewhere between keyboard-up and the keystroke (an iOS analog of the
+/// Mac's `keyRepair` focus-steal)?
 public enum InputResponderIdentity: Int, Sendable, Codable, CaseIterable {
     /// No first responder, or it could not be resolved.
     case none = 0
     /// The expected terminal keyboard proxy (`TerminalInputTextView`). The
-    /// keyboard is driving the view we instrument.
+    /// keyboard is driving the view we instrument; the bug is then in
+    /// auto-repeat/dictation behavior, not in *who* holds focus.
     case terminalInputProxy = 1
     /// The Metal/IOSurface terminal surface itself (`GhosttySurfaceView`).
     case ghosttySurface = 2
