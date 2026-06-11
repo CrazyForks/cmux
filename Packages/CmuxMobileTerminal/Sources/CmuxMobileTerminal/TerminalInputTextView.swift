@@ -153,7 +153,7 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     override func becomeFirstResponder() -> Bool {
         let became = super.becomeFirstResponder()
         #if DEBUG
-        let responder = CurrentResponderProbe.current()
+        let responder = CurrentResponderProbe().current()
         let identity = Self.responderIdentity(of: responder)
         diagnosticLog?.record(DiagnosticEvent(
             .inputBecomeFirstResponder,
@@ -753,7 +753,7 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
         // event. `a` carries the responder identity at the moment of the delete
         // (resolved from the live responder chain, so a focus-steal between
         // keyboard-up and the keystroke is visible, not assumed).
-        let deleteResponder = CurrentResponderProbe.current()
+        let deleteResponder = CurrentResponderProbe().current()
         let deleteIdentity = Self.responderIdentity(of: deleteResponder)
         diagnosticLog?.record(DiagnosticEvent(
             .inputDeleteBackward,

@@ -1376,7 +1376,7 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         // even when the height is unchanged. This is the iOS analog of checking
         // for a Mac-style `keyRepair` focus-steal: if this is not
         // `terminalInputProxy`, the keyboard never drives the view we instrument.
-        let kbResponder = CurrentResponderProbe.current()
+        let kbResponder = CurrentResponderProbe().current()
         let kbIdentity = TerminalInputTextView.responderIdentity(of: kbResponder)
         diagnosticLog?.record(DiagnosticEvent(.inputKeyboardUp, a: kbIdentity.rawValue))
         MobileDebugLog.anchormux(
