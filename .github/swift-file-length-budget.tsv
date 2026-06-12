@@ -40,7 +40,7 @@
 2527	Sources/TerminalNotificationStore.swift
 2513	cmuxTests/CommandPaletteSearchEngineTests.swift
 2509	Sources/KeyboardShortcutSettings.swift
-2389	Sources/Mobile/MobileHostService.swift
+2395	Sources/Mobile/MobileHostService.swift
 2327	cmuxTests/CJKIMEInputTests.swift
 2290	Sources/FileExplorerView.swift
 2260	Sources/TerminalWindowPortal.swift
