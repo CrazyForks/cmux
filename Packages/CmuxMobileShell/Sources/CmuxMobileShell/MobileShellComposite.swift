@@ -561,6 +561,13 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// Tail of the serialized paired-Mac store write chain; see
     /// ``performSerializedPairedMacWrite(ifStillCurrent:_:)``.
     private var pairedMacWriteChain: Task<Void, Never>?
+    /// The in-flight `mobile.events.subscribe` (reason `start`) ack for the
+    /// current listener generation. It runs concurrently with the consumer
+    /// loop (the ack is a server-side enable handshake, not a delivery
+    /// precondition: a prior generation's server subscription keeps pushing
+    /// across re-subscribes) so events arriving during the round-trip are
+    /// consumed, not buffered invisibly behind the await.
+    private var terminalSubscriptionStartTask: Task<Void, Never>?
     // Liveness watchdog for the render-grid push subscription. The `for await`
     // listener loop blocks indefinitely if the underlying connection half-dies
     // (network blip, Mac stops pushing, background/foreground cycle): the
@@ -4717,6 +4724,21 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
               terminalEventListenerID == listenerID,
               remoteClient === client,
               connectionState == .connected else {
+            return
+        }
+        if terminalSubscriptionStartTask != nil {
+            // The stream ended while this generation's enable handshake was
+            // still in flight: the transport dropped before the subscription
+            // ever delivered. Restarting here would supersede the generation
+            // and silently swallow the handshake's failure verdict (its ack
+            // guard sees a newer listenerID), so a closed transport would
+            // loop `reconnecting` forever. Converge instead: a stream that
+            // dies before its handshake completes IS a failed start.
+            mobileShellLog.info("terminal event stream ended before subscribe ack, marking unavailable")
+            MobileDebugLog.anchormux("sync.stream_ended before subscribe ack; failed start")
+            diagnosticLog?.record(DiagnosticEvent(.error))
+            stopTerminalRefreshPolling()
+            markMacConnectionUnavailable()
             return
         }
         mobileShellLog.info("terminal event stream ended, restarting")
