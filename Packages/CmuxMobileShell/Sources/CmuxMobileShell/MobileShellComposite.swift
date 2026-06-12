@@ -617,9 +617,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     private var createTerminalTaskID: UUID?
     private var connectionGeneration: UUID
     private var reportedViewportSizesByTerminalKey: [MobileTerminalViewportKey: MobileTerminalViewportSize]
-    private var deliveredTerminalByteEndSeqBySurfaceID: [String: UInt64]
+    var deliveredTerminalByteEndSeqBySurfaceID: [String: UInt64]
     private var pendingTerminalByteEndSeqBySurfaceID: [String: UInt64]
-    private var terminalReplaySurfaceIDsInFlight: Set<String>
+    var terminalReplaySurfaceIDsInFlight: Set<String>
     private var terminalOutputTransport: TerminalOutputTransport
     private var rawTerminalInputBuffer: MobileTerminalInputSendBuffer
     private var pairingAttemptID: UUID
@@ -5266,7 +5266,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         )
     }
 
-    private func markTerminalBytesDelivered(surfaceID: String, endSeq: UInt64) {
+    func markTerminalBytesDelivered(surfaceID: String, endSeq: UInt64) {
         let current = deliveredTerminalByteEndSeqBySurfaceID[surfaceID] ?? 0
         deliveredTerminalByteEndSeqBySurfaceID[surfaceID] = max(current, endSeq)
         if let pendingSeq = pendingTerminalByteEndSeqBySurfaceID[surfaceID],
@@ -5276,7 +5276,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         }
     }
 
-    private static func terminalSnapshotReplacementBytes(_ snapshotBytes: Data) -> Data {
+    static func terminalSnapshotReplacementBytes(_ snapshotBytes: Data) -> Data {
         var bytes = Data("\u{1B}c\u{1B}[H\u{1B}[2J\u{1B}[3J".utf8)
         bytes.append(snapshotBytes)
         return bytes
@@ -5284,24 +5284,46 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
 
     /// Per-surface output continuations for the libghostty render path. A mounted
     /// `GhosttySurfaceView` obtains a stream via ``terminalOutputStream(surfaceID:)``
-    /// and receives VT patch bytes derived from render-grid frames. Raw PTY bytes
-    /// flow through the same continuation as a compatibility fallback for older
-    /// Mac hosts.
-    private var terminalByteContinuationsBySurfaceID: [String: AsyncStream<Data>.Continuation] = [:]
+    /// and receives ordered ``MobileTerminalOutputChunk`` elements: VT patch bytes
+    /// derived from render-grid frames together with that frame's metadata, or raw
+    /// PTY bytes (no metadata) as a compatibility fallback for older Mac hosts.
+    private var terminalByteContinuationsBySurfaceID: [String: AsyncStream<MobileTerminalOutputChunk>.Continuation] = [:]
 
-    /// Yield a chunk of output bytes to the surface's stream, if one is attached.
-    private func deliverTerminalBytes(_ bytes: Data, surfaceID: String) {
-        terminalByteContinuationsBySurfaceID[surfaceID]?.yield(bytes)
+    /// Yield raw output bytes (no frame metadata) to the surface's stream, if
+    /// one is attached. Compatibility path for older Mac hosts and the raw
+    /// byte-ring fallback.
+    func deliverTerminalBytes(_ bytes: Data, surfaceID: String) {
+        terminalByteContinuationsBySurfaceID[surfaceID]?.yield(MobileTerminalOutputChunk(bytes: bytes))
+    }
+
+    /// Yield one render-grid frame to the surface's stream: its metadata and
+    /// bytes travel as ONE ordered element, so the view applies the metadata
+    /// immediately before that frame's bytes. This makes the local-scroll
+    /// engine's arm-then-consume contract structural (a deeper-fetch restore is
+    /// consumed by the fetch snapshot's own apply, never by an interleaved live
+    /// frame, and bytes can never apply before their own metadata). Delivered
+    /// even when `bytes` is empty: a no-row-change frame still carries the
+    /// active screen.
+    func deliverTerminalFrame(_ frame: MobileTerminalRenderGridFrame, bytes: Data) {
+        let chunk = MobileTerminalOutputChunk(
+            meta: MobileTerminalOutputChunk.FrameMeta(
+                isAlternateScreen: frame.activeScreen == .alternate,
+                isFullSnapshot: frame.full,
+                scrollbackRows: frame.full ? frame.scrollbackRows : 0
+            ),
+            bytes: bytes
+        )
+        terminalByteContinuationsBySurfaceID[frame.surfaceID]?.yield(chunk)
     }
 
     /// Whether a surface currently has an attached output stream consumer.
-    private func hasTerminalOutputSink(surfaceID: String) -> Bool {
+    func hasTerminalOutputSink(surfaceID: String) -> Bool {
         terminalByteContinuationsBySurfaceID[surfaceID] != nil
     }
 
     private func registerTerminalOutput(
         surfaceID: String,
-        continuation: AsyncStream<Data>.Continuation
+        continuation: AsyncStream<MobileTerminalOutputChunk>.Continuation
     ) {
         terminalByteContinuationsBySurfaceID[surfaceID] = continuation
         deliveredTerminalByteEndSeqBySurfaceID.removeValue(forKey: surfaceID)
@@ -5322,14 +5344,15 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         clearTerminalViewport(surfaceID: surfaceID)
     }
 
-    /// The output byte stream for a terminal surface.
+    /// The output stream for a terminal surface (frame metadata + bytes as one
+    /// ordered element per frame; raw compatibility bytes carry no metadata).
     ///
     /// Obtaining the stream arms a cold-attach replay so the surface catches up
     /// to current state; ending iteration (or cancelling the consuming task)
     /// unregisters the surface and clears its viewport pin on the Mac.
     /// - Parameter surfaceID: The terminal surface identifier.
-    /// - Returns: An `AsyncStream` of output byte chunks.
-    public func terminalOutputStream(surfaceID: String) -> AsyncStream<Data> {
+    /// - Returns: An `AsyncStream` of output chunks.
+    public func terminalOutputStream(surfaceID: String) -> AsyncStream<MobileTerminalOutputChunk> {
         AsyncStream { continuation in
             registerTerminalOutput(surfaceID: surfaceID, continuation: continuation)
             continuation.onTermination = { [weak self] _ in
@@ -5402,92 +5425,6 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         }
     }
 
-    /// Cold-attach/self-heal replay. Prefer the Mac's bounded render-grid
-    /// snapshot, replacing the local iOS terminal state before live bytes
-    /// resume. The VT snapshot and raw byte ring remain fallbacks, but neither
-    /// is the target architecture: a byte tail is not a complete screen state
-    /// for TUIs, and a VT export is still a replay stream rather than state.
-    private func requestTerminalReplay(surfaceID: String) {
-        guard let client = remoteClient else {
-            #if DEBUG
-            mobileShellLog.error("CMUX_REPLAY skip surface=\(surfaceID, privacy: .public) reason=no_remote_client")
-            #endif
-            return
-        }
-        guard let workspaceID = workspaceID(forTerminalID: surfaceID) else {
-            #if DEBUG
-            mobileShellLog.error("CMUX_REPLAY skip surface=\(surfaceID, privacy: .public) reason=workspace_not_found")
-            #endif
-            return
-        }
-        guard !terminalReplaySurfaceIDsInFlight.contains(surfaceID) else {
-            #if DEBUG
-            mobileShellLog.info("CMUX_REPLAY skip surface=\(surfaceID, privacy: .public) reason=in_flight")
-            #endif
-            return
-        }
-        terminalReplaySurfaceIDsInFlight.insert(surfaceID)
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            defer { self.terminalReplaySurfaceIDsInFlight.remove(surfaceID) }
-            do {
-                let request = try MobileCoreRPCClient.requestData(
-                    method: "mobile.terminal.replay",
-                    params: [
-                        "workspace_id": workspaceID.rawValue,
-                        "surface_id": surfaceID,
-                    ]
-                )
-                let data = try await client.sendRequest(request)
-                guard self.remoteClient === client else { return }
-                let payload = try? MobileTerminalReplayResponse.decode(data)
-                let bytes = payload?.dataBase64.flatMap { Data(base64Encoded: $0) }
-                let snapshotBytes = payload?.snapshotBase64.flatMap { Data(base64Encoded: $0) }
-                let decodedRenderGrid = payload?.renderGrid
-                let renderGrid = decodedRenderGrid?.surfaceID == surfaceID ? decodedRenderGrid : nil
-                let replaySeq = renderGrid?.stateSeq ?? payload?.sequence
-                #if DEBUG
-                let seq = replaySeq ?? 0
-                let cols = payload?.columns ?? -1
-                let rows = payload?.rows ?? -1
-                mobileShellLog.info("CMUX_REPLAY response surface=\(surfaceID, privacy: .public) byteCount=\(bytes?.count ?? -1, privacy: .public) snapshotBytes=\(snapshotBytes?.count ?? -1, privacy: .public) renderGrid=\(renderGrid != nil, privacy: .public) seq=\(seq, privacy: .public) macGrid=\(cols, privacy: .public)x\(rows, privacy: .public) hasSink=\(self.hasTerminalOutputSink(surfaceID: surfaceID), privacy: .public)")
-                #endif
-                if let replaySeq,
-                   let deliveredSeq = self.deliveredTerminalByteEndSeqBySurfaceID[surfaceID],
-                   deliveredSeq > replaySeq {
-                    MobileDebugLog.anchormux("CMUX_REPLAY stale surface=\(surfaceID) delivered=\(deliveredSeq) replay=\(replaySeq)")
-                    return
-                }
-                let deliverBytes: Data?
-                if let renderGrid {
-                    deliverBytes = renderGrid.vtPatchBytes()
-                    MobileDebugLog.anchormux("CMUX_REPLAY render_grid surface=\(surfaceID) spans=\(renderGrid.rowSpans.count) seq=\(renderGrid.stateSeq)")
-                } else if let snapshotBytes, !snapshotBytes.isEmpty {
-                    deliverBytes = Self.terminalSnapshotReplacementBytes(snapshotBytes)
-                    MobileDebugLog.anchormux("CMUX_REPLAY snapshot surface=\(surfaceID) bytes=\(snapshotBytes.count) seq=\(replaySeq ?? 0)")
-                } else {
-                    deliverBytes = bytes
-                    MobileDebugLog.anchormux("CMUX_REPLAY raw_tail surface=\(surfaceID) bytes=\(bytes?.count ?? -1) seq=\(replaySeq ?? 0)")
-                }
-                if let replaySeq {
-                    self.markTerminalBytesDelivered(surfaceID: surfaceID, endSeq: replaySeq)
-                }
-                guard let deliverBytes, !deliverBytes.isEmpty else {
-                    return
-                }
-                self.deliverTerminalBytes(deliverBytes, surfaceID: surfaceID)
-            } catch {
-                mobileShellLog.error("CMUX_REPLAY failed surface=\(surfaceID, privacy: .public) error=\(String(describing: error), privacy: .public)")
-                // The replay request is the view-only/foreground-resume path. A
-                // definitive auth failure here (after the RPC layer's
-                // force-refresh-and-retry already gave up) must drive the re-auth
-                // prompt instead of silently leaving a stale frame.
-                guard self.remoteClient === client else { return }
-                _ = self.disconnectForAuthorizationFailureIfNeeded(error)
-            }
-        }
-    }
-
     func workspaceID(forTerminalID terminalID: String) -> MobileWorkspacePreview.ID? {
         for workspace in workspaces {
             if workspace.terminals.contains(where: { $0.id.rawValue == terminalID }) {
@@ -5528,8 +5465,12 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         #if DEBUG
         mobileShellLog.info("CMUX_REPLAY live render_grid surface=\(renderGrid.surfaceID, privacy: .public) full=\(renderGrid.full, privacy: .public) spans=\(renderGrid.rowSpans.count, privacy: .public) cleared=\(renderGrid.clearedRows.count, privacy: .public) seq=\(renderGrid.stateSeq, privacy: .public) hasSink=true")
         #endif
-        guard !bytes.isEmpty else { return }
-        deliverTerminalBytes(bytes, surfaceID: renderGrid.surfaceID)
+        // One ordered element: the frame's metadata (active screen, snapshot
+        // scrollback depth) rides with its bytes, so the view's local-scroll
+        // gates always see a frame's metadata immediately before its apply.
+        // Empty-byte frames still flow: a no-row-change frame carries the
+        // active screen.
+        deliverTerminalFrame(renderGrid, bytes: bytes)
     }
 
     private func handleNotificationDismissedEvent(_ event: MobileEventEnvelope) async {
@@ -5837,7 +5778,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         return true
     }
 
-    private func disconnectForAuthorizationFailureIfNeeded(_ error: any Error) -> Bool {
+    func disconnectForAuthorizationFailureIfNeeded(_ error: any Error) -> Bool {
         guard Self.shouldDisconnectForAuthorizationFailure(error) else {
             return false
         }
