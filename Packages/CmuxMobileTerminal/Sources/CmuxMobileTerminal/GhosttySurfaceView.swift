@@ -779,7 +779,10 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// Serial background queue for `ghostty_surface_process_output`, which
     /// blocks on libghostty's internal renderer/IO futex. Running it on the
     /// main thread hangs the app until the scene-update watchdog kills it.
-    private static let outputQueue = DispatchQueue(
+    /// Internal (not private) so the copyable-text extension in
+    /// `GhosttySurfaceCopyableText.swift` can enqueue its surface read with
+    /// the same FIFO-before-dispose ordering discipline.
+    static let outputQueue = DispatchQueue(
         label: "dev.cmux.GhosttySurfaceView.output",
         qos: .userInitiated
     )
@@ -3912,44 +3915,6 @@ private struct VisibleSnapshotRequest: @unchecked Sendable {
 /// caller never reads it, leaving the queue task the sole accessor.
 private final class VisibleSnapshotHolder: @unchecked Sendable {
     var sections: [String] = []
-}
-
-private final class WeakGhosttySurfaceViewBox {
-    weak var value: GhosttySurfaceView?
-
-    init(_ value: GhosttySurfaceView) {
-        self.value = value
-    }
-}
-
-private extension GhosttySurfaceView {
-    @MainActor
-    static var registeredSurfaceViews: [UInt: WeakGhosttySurfaceViewBox] = [:]
-
-    @MainActor
-    static func register(surface: ghostty_surface_t, for view: GhosttySurfaceView) {
-        registeredSurfaceViews[surfaceIdentifier(for: surface)] = WeakGhosttySurfaceViewBox(view)
-        registeredSurfaceViews = registeredSurfaceViews.filter { $0.value.value != nil }
-    }
-
-    @MainActor
-    static func unregister(surface: ghostty_surface_t) {
-        registeredSurfaceViews.removeValue(forKey: surfaceIdentifier(for: surface))
-    }
-
-    @MainActor
-    static func view(for surface: ghostty_surface_t) -> GhosttySurfaceView? {
-        let identifier = surfaceIdentifier(for: surface)
-        guard let view = registeredSurfaceViews[identifier]?.value else {
-            registeredSurfaceViews.removeValue(forKey: identifier)
-            return nil
-        }
-        return view
-    }
-
-    static func surfaceIdentifier(for surface: ghostty_surface_t) -> UInt {
-        UInt(bitPattern: UnsafeRawPointer(surface))
-    }
 }
 
 private class DisplayLinkProxy {
