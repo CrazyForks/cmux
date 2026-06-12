@@ -256,9 +256,11 @@ public final class MobilePushCoordinator {
         await registration.syncTokenIfPossible()
     }
 
-    /// Remove the cached token from the server (on sign-out).
-    public func unregisterFromServer() async {
-        await registration.unregisterFromServer()
+    /// Remove the cached token from the server (on sign-out), authenticating
+    /// with the credentials captured before the local-first sign-out cleared
+    /// the live token store.
+    public func unregisterFromServer(accessToken: String?, refreshToken: String?) async {
+        await registration.unregisterFromServer(accessToken: accessToken, refreshToken: refreshToken)
     }
 
     /// Sign-out cleanup: reset the observable to empty and remove the device
