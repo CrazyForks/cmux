@@ -1791,6 +1791,9 @@ class TerminalController {
 
         case "screenshot":
             return captureScreenshot(args)
+
+        case "dogfood_checklist_set":
+            return setDogfoodChecklist(args)
 #endif
 
         case "help":
@@ -1923,6 +1926,8 @@ class TerminalController {
             return v2Result(id: id, self.v2MobileTerminalViewport(params: params))
         case "mobile.terminal.scroll", "terminal.scroll":
             return v2Result(id: id, self.v2MobileTerminalScroll(params: params))
+        case "mobile.terminal.scroll_to_bottom", "terminal.scroll_to_bottom":
+            return v2Result(id: id, self.v2MobileTerminalScrollToBottom(params: params))
         case "mobile.terminal.mouse", "terminal.mouse":
             return v2Result(id: id, self.v2MobileTerminalMouse(params: params))
 
@@ -5136,7 +5141,7 @@ class TerminalController {
             : .err(code: "not_found", message: "Group not found", data: ["group_id": gid.uuidString])
     }
 
-    private func v2WorkspaceGroupSetCollapsed(params: [String: Any], isCollapsed: Bool) -> V2CallResult {
+    func v2WorkspaceGroupSetCollapsed(params: [String: Any], isCollapsed: Bool) -> V2CallResult {
         guard let tabManager = v2ResolveTabManager(params: params) else {
             return .err(code: "unavailable", message: "TabManager not available", data: nil)
         }
@@ -16893,6 +16898,7 @@ class TerminalController {
           flash_count <id|idx>            - Read flash count for a panel
           reset_flash_counts              - Reset flash counters
           screenshot [label]              - Capture window screenshot
+          dogfood_checklist_set <json>    - Push a DEV dogfood checklist to paired phones (test-only)
           set_shortcut <name> <combo|clear> - Set a keyboard shortcut (test-only)
           simulate_shortcut <combo>       - Simulate a keyDown shortcut (test-only)
           simulate_type <text>            - Insert text into the current first responder (test-only)
@@ -18825,6 +18831,34 @@ class TerminalController {
 
         // Return OK with screenshot ID and path for easy reference
         return "OK \(screenshotId) \(outputPath.path)"
+    }
+
+    /// DEV-only `dogfood_checklist_set <json>`: store the agent's "what to check"
+    /// checklist on ``MobileHostService`` and push it to every subscribed phone.
+    ///
+    /// The agent drives this via
+    /// `CMUX_TAG=<tag> scripts/cmux-debug-cli.sh dogfood_checklist_set '<json>'`
+    /// where `<json>` is a top-level object, for example:
+    /// `{"title":"Pane test","items":[{"id":"drag","prompt":"Drag works?","kind":"pass_fail"}]}`.
+    /// Pass an empty body, `clear`, `null`, or `{}` to clear the checklist (the
+    /// phone is pushed an empty checklist and shows its empty state). The Mac
+    /// treats a non-empty checklist as opaque (the phone owns the typed decode),
+    /// validating only that it is a size-capped top-level object.
+    private func setDogfoodChecklist(_ args: String) -> String {
+        let trimmed = args.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Explicit clear forms: empty, the `clear` keyword, or a JSON null.
+        if trimmed.isEmpty || trimmed.lowercased() == "clear" || trimmed == "null" {
+            v2MainSync { MobileHostService.shared.clearDogfoodChecklist() }
+            return "OK dogfood checklist cleared"
+        }
+        guard let data = trimmed.data(using: .utf8) else {
+            return "ERROR: checklist is not valid UTF-8"
+        }
+        let ok = v2MainSync { MobileHostService.shared.setDogfoodChecklist(rawJSON: data) }
+        guard ok else {
+            return "ERROR: checklist must be a top-level JSON object under \(MobileHostService.dogfoodChecklistMaxBytes) bytes"
+        }
+        return "OK dogfood checklist set (\(data.count) bytes)"
     }
 
     private func captureCompositedWindowPNGData(_ window: NSWindow) -> Data? {
@@ -21523,12 +21557,28 @@ class TerminalController {
             result = v2MobileTerminalViewport(params: request.params)
         case "mobile.terminal.scroll", "terminal.scroll":
             result = v2MobileTerminalScroll(params: request.params)
+        case "mobile.terminal.scroll_to_bottom", "terminal.scroll_to_bottom":
+            result = v2MobileTerminalScrollToBottom(params: request.params)
         case "mobile.terminal.mouse", "terminal.mouse":
             result = v2MobileTerminalMouse(params: request.params)
         case "workspace.action":
             result = v2MobileWorkspaceAction(params: request.params)
+        case "notification.dismiss":
+            result = v2MobileNotificationDismiss(params: request.params)
+        case "mobile.notifications.list", "notifications.list":
+            result = v2MobileNotificationsList(params: request.params)
+        case "mobile.notifications.mark_read", "notifications.mark_read":
+            result = v2MobileNotificationsMarkRead(params: request.params)
+        case "workspace.group.collapse":
+            result = v2MobileWorkspaceGroupSetCollapsed(params: request.params, isCollapsed: true)
+        case "workspace.group.expand":
+            result = v2MobileWorkspaceGroupSetCollapsed(params: request.params, isCollapsed: false)
         case "dogfood.feedback.submit":
             result = await v2MobileDogfoodFeedbackSubmit(params: request.params)
+#if DEBUG
+        case "dogfood.checklist.fetch":
+            result = v2MobileDogfoodChecklistFetch()
+#endif
         default:
             result = .err(code: "method_not_found", message: "Unknown mobile method", data: [
                 "method": request.method
@@ -21536,6 +21586,87 @@ class TerminalController {
         }
         return mobileHostResult(result)
     }
+
+    /// `mobile.notifications.list`: the recent notification feed the iOS
+    /// Notifications hub mirrors. Reads `TerminalNotificationStore.shared`, sorts
+    /// newest-first, caps to the recent window, and maps to a snake_case wire
+    /// shape with `created_at` as Unix epoch seconds (the phone decodes it into a
+    /// `Date`). This is the snapshot the phone pulls on cold-attach and on every
+    /// `notifications.updated` signal.
+    ///
+    /// Authorization: like `workspace.list`, this returns the user's own state
+    /// across all of their Mac's workspaces and is account-scoped by same-account
+    /// Stack auth, which is the SOLE authorization gate for the mobile data plane
+    /// (`MobileHostService.authorizationError(for:)`). The attach ticket is
+    /// route-discovery + workspace-selection only and never authorizes on its
+    /// own, and `mobile.attach_ticket.create` itself requires the same-account
+    /// Stack token to mint, so every caller here is the Mac owner reading their
+    /// own notifications. Confining the feed to a single workspace (cross-account
+    /// or scoped sharing) would require a data-plane-wide scope model, not a
+    /// notifications-only check, and is out of scope for this foundation.
+    private func v2MobileNotificationsList(params: [String: Any]) -> V2CallResult {
+        let recent = TerminalNotificationStore.shared.notifications
+            .sorted { $0.createdAt > $1.createdAt }
+            .prefix(Self.mobileNotificationRecentLimit)
+        let items: [[String: Any]] = recent.map { notification in
+            [
+                "id": notification.id.uuidString,
+                "workspace_id": notification.tabId.uuidString,
+                // The workspace's display title, so the feed row can name which
+                // workspace/Mac the notification came from (titles are activity
+                // strings like "Claude finished" with no workspace context).
+                // Null when the workspace has closed or has no title.
+                "workspace_name": v2OrNull(AppDelegate.shared?.tabTitle(for: notification.tabId)),
+                "surface_id": v2OrNull(notification.surfaceId?.uuidString),
+                "title": notification.title,
+                "subtitle": notification.subtitle,
+                "body": notification.body,
+                "created_at": notification.createdAt.timeIntervalSince1970,
+                "is_read": notification.isRead,
+            ]
+        }
+        return .ok(["notifications": items])
+    }
+
+    /// `mobile.notifications.mark_read`: mark a single notification (`id`) or a
+    /// whole workspace (`workspace_id`) read on the Mac. Routes through the same
+    /// `TerminalNotificationStore` read-state path the Mac UI uses (no parallel
+    /// copy), so the Mac stops re-notifying and the store change re-emits
+    /// `notifications.updated` to reconcile every connected phone.
+    private func v2MobileNotificationsMarkRead(params: [String: Any]) -> V2CallResult {
+        // Reject any present-but-invalid selector first. This is a mutating RPC
+        // at a trust boundary: a malformed `id` alongside a valid `workspace_id`
+        // must NOT silently downgrade to a broader workspace-wide mark-read than
+        // the caller asked for. Mirrors `v2MobileWorkspaceList`'s
+        // `v2HasNonNullParam`-guarded UUID validation.
+        let id = v2UUID(params, "id")
+        if v2HasNonNullParam(params, "id"), id == nil {
+            return .err(code: "invalid_params", message: "Missing or invalid id", data: nil)
+        }
+        let workspaceID = v2UUID(params, "workspace_id")
+        if v2HasNonNullParam(params, "workspace_id"), workspaceID == nil {
+            return .err(code: "invalid_params", message: "Missing or invalid workspace_id", data: nil)
+        }
+        // Exactly one selector. Both/neither is a client bug, not a partial op.
+        let selectorCount = (id == nil ? 0 : 1) + (workspaceID == nil ? 0 : 1)
+        guard selectorCount == 1 else {
+            return .err(
+                code: "invalid_params",
+                message: "Provide exactly one of id or workspace_id",
+                data: nil
+            )
+        }
+        if let id {
+            TerminalNotificationStore.shared.markRead(id: id)
+        } else if let workspaceID {
+            TerminalNotificationStore.shared.markRead(forTabId: workspaceID)
+        }
+        return .ok(["ok": true])
+    }
+
+    /// Recent-notification window the mobile feed mirrors. Kept in sync with the
+    /// phone-side `MobileNotificationsStore.recentLimit` and the observer hash.
+    private static let mobileNotificationRecentLimit = 200
 
     /// Hard caps for the agent feedback sink. The only intended caller is a
     /// paired phone, but a malformed or hostile request must not be able to
@@ -21548,6 +21679,13 @@ class TerminalController {
     nonisolated private static let dogfoodFeedbackMaxBuildStampChars = 512
     nonisolated private static let dogfoodFeedbackMaxBlobBase64Chars = 8_388_608 // ~6 MiB decoded
     nonisolated private static let dogfoodFeedbackMaxBlobBytes = 6_291_456 // 6 MiB
+    /// P2 additive caps: the multiple-choice answers JSON (capped by character
+    /// count before parse) and the chrome screenshot PNG (rejected past its
+    /// base64 cap so it is never decoded; a decoded PNG past the byte cap is
+    /// dropped without failing the rest of the bundle).
+    nonisolated private static let dogfoodFeedbackMaxAnswersChars = 65_536
+    nonisolated private static let dogfoodFeedbackMaxScreenshotBase64Chars = 8_388_608 // ~6 MiB decoded
+    nonisolated private static let dogfoodFeedbackMaxScreenshotBytes = 6_291_456 // 6 MiB
     /// Keep at most this many bundle directories; older ones are pruned after
     /// each write so a retrying client can't grow the cache without bound.
     nonisolated private static let dogfoodFeedbackMaxRetainedBundles = 50
@@ -21565,20 +21703,24 @@ class TerminalController {
 
     /// Privileged agent feedback sink (the Mac↔phone feedback loop).
     ///
-    /// Decodes `{ text, terminal_text, build_stamp, diagnostic_blob_base64 }`,
-    /// writes a self-contained bundle directory under
+    /// Decodes `{ text, terminal_text, build_stamp, diagnostic_blob_base64 }`
+    /// plus the P2-additive `{ answers_json, screenshot_png_base64 }`, writes a
+    /// self-contained bundle directory under
     /// `~/.cache/cmux-dogfood-feedback/<ISO8601>_<shortid>/` (a `bundle.json`
-    /// manifest plus the decoded `diagnostic.log`), and returns the bundle path.
-    /// It is protected by the same-account Stack-auth authorization the rest of
-    /// the mobile data plane enforces, so it never accepts an unauthenticated
-    /// caller. The phone only ever routes here for `@manaflow.ai` users on an
-    /// active connection, so this exists in Release builds too (the team can
-    /// dogfood beta/prod), and only a Mac that runs the watcher acts on it.
+    /// manifest, the decoded `diagnostic.log`, and `screenshot.png` when present),
+    /// and returns the bundle path. It is protected by the same-account Stack-auth
+    /// authorization the rest of the mobile data plane enforces, so it never
+    /// accepts an unauthenticated caller, and by the `isPrivilegedFeedbackEmail`
+    /// check at the trust boundary. The phone only ever routes here for
+    /// `@manaflow.ai` users on an active connection, so this exists in Release
+    /// builds too (the team can dogfood beta/prod), and only a Mac that runs the
+    /// watcher acts on it.
     ///
     /// Field sizes are capped on the main actor *before* any large allocation,
     /// invalid/oversized base64 is rejected without decoding, and the decode +
     /// filesystem writes run off the main actor so a large payload cannot block
-    /// the Mac UI.
+    /// the Mac UI. The P2 fields are optional, so a P1 phone's request is handled
+    /// exactly as before.
     private func v2MobileDogfoodFeedbackSubmit(params: [String: Any]) async -> V2CallResult {
         // Privilege check at the trust boundary: the mobile data plane only
         // accepts same-account connections, so the caller is this Mac's own Stack
@@ -21610,9 +21752,24 @@ class TerminalController {
                 data: nil
             )
         }
+        // P2 answers: a capped JSON string, validated as a top-level object off
+        // the request hot path but cheap enough to parse here. An invalid/missing
+        // answers blob is simply dropped (P1 compatibility), never an error.
+        let answersJSONString = String((v2RawString(params, "answers_json") ?? "").prefix(Self.dogfoodFeedbackMaxAnswersChars))
+        // P2 screenshot: reject an oversized base64 PNG outright (never decoded);
+        // an absent one is the P1 path. Dropping it must not fail the bundle.
+        let screenshotBase64 = v2RawString(params, "screenshot_png_base64") ?? ""
+        guard screenshotBase64.count <= Self.dogfoodFeedbackMaxScreenshotBase64Chars else {
+            return .err(
+                code: "invalid_params",
+                message: "screenshot_png_base64 exceeds size limit",
+                data: nil
+            )
+        }
 
         let maxBlobBytes = Self.dogfoodFeedbackMaxBlobBytes
-        // Off-main: decode the blob and write the bundle. A `Task.detached`
+        let maxScreenshotBytes = Self.dogfoodFeedbackMaxScreenshotBytes
+        // Off-main: decode the blobs and write the bundle. A `Task.detached`
         // keeps the (potentially multi-MiB) decode + synchronous file I/O off the
         // main actor so it never stalls the Mac UI. Returns a Sendable result.
         let outcome = await Task.detached(priority: .utility) { () -> DogfoodFeedbackWriteOutcome in
@@ -21620,11 +21777,19 @@ class TerminalController {
             guard decoded.count <= maxBlobBytes else {
                 return .rejected(reason: "diagnostic blob exceeds size limit")
             }
+            // A decoded screenshot past the byte cap (or undecodable) is dropped,
+            // not fatal: the rest of the bundle still ships.
+            var screenshot = screenshotBase64.isEmpty ? nil : Data(base64Encoded: screenshotBase64)
+            if let s = screenshot, s.count > maxScreenshotBytes {
+                screenshot = nil
+            }
             return Self.writeDogfoodFeedbackBundle(
                 text: text,
                 terminalText: terminalText,
                 buildStamp: buildStamp,
-                diagnosticData: decoded
+                diagnosticData: decoded,
+                answersJSONString: answersJSONString.isEmpty ? nil : answersJSONString,
+                screenshotData: screenshot
             )
         }.value
 
@@ -21646,6 +21811,18 @@ class TerminalController {
         }
     }
 
+    /// DEV-only `dogfood.checklist.fetch`: return the current agent-pushed
+    /// checklist so the phone can pull it on open (closing the subscribe-after-push
+    /// race). Returns `{ checklist: {...} }` when one is set, or `{ checklist:
+    /// null }` when none has been pushed. Auth-gated like the rest of the mobile
+    /// data plane (`requiresAuthorization` defaults to `true`).
+    private func v2MobileDogfoodChecklistFetch() -> V2CallResult {
+        if let checklist = MobileHostService.shared.currentDogfoodChecklist() {
+            return .ok(["checklist": checklist])
+        }
+        return .ok(["checklist": NSNull()])
+    }
+
     /// The result of writing a dogfood feedback bundle off the main actor.
     private enum DogfoodFeedbackWriteOutcome: Sendable {
         case written(bundlePath: String, byteCount: Int)
@@ -21656,11 +21833,21 @@ class TerminalController {
     /// Persist a validated dogfood feedback bundle to disk. Runs off the main
     /// actor (called from a detached task), so its synchronous file I/O never
     /// blocks the Mac UI. All inputs are already size-capped by the caller.
+    ///
+    /// - Parameters:
+    ///   - answersJSONString: The P2 multiple-choice answers as a JSON string,
+    ///     parsed into the manifest's `answers` object; `nil` for the P1 path or
+    ///     when unparseable.
+    ///   - screenshotData: The P2 chrome screenshot PNG written as
+    ///     `screenshot.png` and referenced from the manifest; `nil` when absent
+    ///     or dropped past the size cap.
     nonisolated private static func writeDogfoodFeedbackBundle(
         text: String,
         terminalText: String,
         buildStamp: String,
-        diagnosticData: Data
+        diagnosticData: Data,
+        answersJSONString: String? = nil,
+        screenshotData: Data? = nil
     ) -> DogfoodFeedbackWriteOutcome {
         let fileManager = FileManager.default
         let root = fileManager.homeDirectoryForCurrentUser
@@ -21696,7 +21883,7 @@ class TerminalController {
             let diagnosticURL = bundleDir.appendingPathComponent("diagnostic.log")
             try diagnosticData.write(to: diagnosticURL)
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: diagnosticURL.path)
-            let manifest: [String: Any] = [
+            var manifest: [String: Any] = [
                 "schema": "cmux.dogfood.feedback.v1",
                 "received_at": formatter.string(from: Date()),
                 "text": text,
@@ -21705,6 +21892,24 @@ class TerminalController {
                 "diagnostic_log_file": "diagnostic.log",
                 "diagnostic_log_bytes": diagnosticData.count,
             ]
+            // P2: parse the answers JSON into the manifest as a nested object so a
+            // reader can map answers back to checklist item ids. A non-object or
+            // unparseable answers blob is omitted rather than failing the bundle.
+            if let answersJSONString,
+               let answersData = answersJSONString.data(using: .utf8),
+               let answersObject = try? JSONSerialization.jsonObject(with: answersData) as? [String: Any] {
+                manifest["answers"] = answersObject
+            }
+            // P2: write the chrome screenshot alongside the manifest and reference
+            // it. The terminal renders blank in a UIView snapshot, which is why
+            // the terminal *text* is also in `terminal_text`.
+            if let screenshotData {
+                let screenshotURL = bundleDir.appendingPathComponent("screenshot.png")
+                try screenshotData.write(to: screenshotURL)
+                try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: screenshotURL.path)
+                manifest["screenshot_file"] = "screenshot.png"
+                manifest["screenshot_bytes"] = screenshotData.count
+            }
             let manifestData = try JSONSerialization.data(
                 withJSONObject: manifest,
                 options: [.prettyPrinted, .sortedKeys]
@@ -21739,6 +21944,53 @@ class TerminalController {
         for stale in directories.dropLast(keep) {
             try? fileManager.removeItem(at: stale)
         }
+    }
+
+    /// Mark notifications read on the Mac in response to the user dismissing the
+    /// mirrored banner on a paired phone. Accepts either a single `notification_id`
+    /// or a `notification_ids` array; ignores unknown/malformed ids.
+    ///
+    /// Deliberately uses ``TerminalNotificationStore/markRead(id:)`` — NOT
+    /// `remove` — so it mirrors a Mac banner *swipe* (which the Mac's own
+    /// `UNUserNotificationCenterDelegate` handles via `markRead`, keeping the
+    /// entry in the notification list while clearing the banner + unread). This
+    /// is distinct from the socket `notification.dismiss` verb
+    /// (``v2NotificationDismiss(params:)``), which fully `remove`s the entry. The
+    /// resulting `markRead` emits `notification.dismissed` back, a harmless no-op
+    /// for the already-removed phone banner. Carries only opaque UUIDs, never
+    /// terminal content.
+    private func v2MobileNotificationDismiss(params: [String: Any]) -> V2CallResult {
+        var rawIDs: [String] = []
+        if let single = v2OptionalTrimmedRawString(params, "notification_id") {
+            rawIDs.append(single)
+        }
+        if let array = params["notification_ids"] as? [Any] {
+            for value in array {
+                if let string = (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !string.isEmpty {
+                    rawIDs.append(string)
+                }
+            }
+        }
+        let ids = rawIDs.compactMap { UUID(uuidString: $0) }
+        guard !ids.isEmpty else {
+            return .err(
+                code: "invalid_params",
+                message: "Missing or invalid notification_id / notification_ids",
+                data: nil
+            )
+        }
+        let store = TerminalNotificationStore.shared
+        // `dismissed` counts notifications that actually transitioned unread→read,
+        // not the number of ids supplied: unknown or already-read ids are no-ops,
+        // so a stale/duplicate phone dismiss reports 0 rather than a misleading hit.
+        let unreadIDs = Set(store.notifications.filter { !$0.isRead }.map(\.id))
+        var dismissed = 0
+        for id in ids where unreadIDs.contains(id) {
+            store.markRead(id: id)
+            dismissed += 1
+        }
+        return .ok(["dismissed": dismissed])
     }
 
     /// The `workspace.action` sub-actions the mobile data plane may invoke.
@@ -21933,170 +22185,14 @@ class TerminalController {
         }
     }
 
-    private func v2MobileWorkspaceList(
-        params: [String: Any],
-        tabManager resolvedTabManager: TabManager? = nil,
-        createdWorkspaceID: String? = nil,
-        createdTerminalID: String? = nil
-    ) -> V2CallResult {
-        let requestedWorkspaceID = v2UUID(params, "workspace_id")
-        if v2HasNonNullParam(params, "workspace_id"), requestedWorkspaceID == nil {
-            return .err(code: "invalid_params", message: "Missing or invalid workspace_id", data: nil)
-        }
-        let requestedTerminalID: UUID?
-        switch mobileTerminalAliasUUID(params: params) {
-        case .missing:
-            requestedTerminalID = nil
-        case let .value(terminalID):
-            requestedTerminalID = terminalID
-        case .invalid:
-            return .err(code: "invalid_params", message: "Missing or invalid terminal_id", data: nil)
-        case .conflict:
-            return .err(code: "invalid_params", message: "Conflicting terminal identifiers", data: nil)
-        }
-
-        // The phone shows workspaces from *every* open Mac window. Enumerate all
-        // registered main windows and flatten their workspaces into one list,
-        // but only when the caller has not named a specific target. When a
-        // `workspace_id`, `window_id`, terminal alias, or an explicit
-        // `resolvedTabManager` (the create/terminal-create paths pass one) is
-        // present, keep today's single-window scoped behavior so those requests
-        // resolve exactly the named target.
-        let scopeToSingleWindow = resolvedTabManager != nil
-            || requestedWorkspaceID != nil
-            || v2HasNonNullParam(params, "window_id")
-            || requestedTerminalID != nil
-
-        // `is_selected` has no single answer across multiple windows. Mark only
-        // the frontmost/key window's selected workspace as selected; in the old
-        // single-window path this is exactly the one selected workspace. Using
-        // `currentScriptableMainWindow()` (not `isKeyWindow`) means a backgrounded
-        // app, where no window is key, still reports the same selection the old
-        // path would have, instead of marking nothing selected.
-        let selectedWorkspaceID = scopeToSingleWindow
-            ? nil
-            : AppDelegate.shared?.currentScriptableMainWindow()?.tabManager.selectedTabId
-
-        let workspaces: [[String: Any]]
-        if scopeToSingleWindow {
-            guard let tabManager = resolvedTabManager ?? v2ResolveTabManager(params: params) else {
-                return .err(code: "unavailable", message: "Workspace context is unavailable", data: nil)
-            }
-            let visibleWorkspaces = requestedWorkspaceID.map { workspaceID in
-                tabManager.tabs.filter { $0.id == workspaceID }
-            } ?? tabManager.tabs
-            if let requestedWorkspaceID, visibleWorkspaces.isEmpty {
-                return .err(
-                    code: "not_found",
-                    message: "Workspace not found",
-                    data: ["workspace_id": requestedWorkspaceID.uuidString]
-                )
-            }
-            let scopedWorkspaces = visibleWorkspaces.map { workspace in
-                mobileWorkspacePayload(
-                    workspace: workspace,
-                    isSelected: workspace.id == tabManager.selectedTabId,
-                    requestedTerminalID: requestedTerminalID
-                )
-            }
-            if let requestedTerminalID,
-               !scopedWorkspaces.contains(where: { workspace in
-                   guard let terminals = workspace["terminals"] as? [[String: Any]] else { return false }
-                   return terminals.contains { ($0["id"] as? String) == requestedTerminalID.uuidString }
-               }) {
-                return .err(
-                    code: "not_found",
-                    message: "Terminal not found",
-                    data: ["surface_id": requestedTerminalID.uuidString]
-                )
-            }
-            workspaces = scopedWorkspaces
-        } else {
-            guard let app = AppDelegate.shared else {
-                return .err(code: "unavailable", message: "Workspace context is unavailable", data: nil)
-            }
-            var flattened: [[String: Any]] = []
-            // `listMainWindowSummaries()` already dedupes window ids, but guard
-            // against the same window or workspace appearing twice anyway: a
-            // workspace lives in exactly one window, and ids are globally unique.
-            var seenWindowIDs: Set<UUID> = []
-            var seenWorkspaceIDs: Set<UUID> = []
-            for summary in app.listMainWindowSummaries() {
-                guard seenWindowIDs.insert(summary.windowId).inserted else { continue }
-                guard let windowTabManager = app.tabManagerFor(windowId: summary.windowId) else { continue }
-                for workspace in windowTabManager.tabs where seenWorkspaceIDs.insert(workspace.id).inserted {
-                    flattened.append(
-                        mobileWorkspacePayload(
-                            workspace: workspace,
-                            isSelected: workspace.id == selectedWorkspaceID,
-                            requestedTerminalID: requestedTerminalID
-                        )
-                    )
-                }
-            }
-            workspaces = flattened
-        }
-
-        var payload: [String: Any] = [
-            "workspaces": workspaces
-        ]
-        if let createdWorkspaceID {
-            payload["created_workspace_id"] = createdWorkspaceID
-        }
-        if let createdTerminalID {
-            payload["created_terminal_id"] = createdTerminalID
-        }
-        return .ok(payload)
-    }
-
-    /// Serializes one workspace into the iOS-facing mobile workspace list shape.
-    ///
-    /// Shared by the single-window (scoped) and all-windows enumeration branches
-    /// of `v2MobileWorkspaceList` so the two never diverge. When
-    /// `requestedTerminalID` is non-nil the terminals array is filtered to that
-    /// one terminal (only the scoped branch passes it; the all-windows branch
-    /// always passes nil, so it lists every terminal). The scoped
-    /// terminal-not-found check is enforced by the caller after the list is built.
-    private func mobileWorkspacePayload(
-        workspace: Workspace,
-        isSelected: Bool,
-        requestedTerminalID: UUID?
-    ) -> [String: Any] {
-        let terminals = mobileTerminalPanels(in: workspace).compactMap { terminal -> [String: Any]? in
-            if let requestedTerminalID, terminal.id != requestedTerminalID {
-                return nil
-            }
-            return [
-                "id": terminal.id.uuidString,
-                "title": workspace.panelTitle(panelId: terminal.id) ?? terminal.displayTitle,
-                "current_directory": v2OrNull(
-                    mobileNonEmpty(workspace.panelDirectories[terminal.id])
-                        ?? mobileNonEmpty(terminal.directory)
-                        ?? mobileNonEmpty(terminal.requestedWorkingDirectory)
-                ),
-                "is_ready": terminal.surface.surface != nil,
-                "is_focused": terminal.id == workspace.focusedPanelId
-            ]
-        }
-
-        return [
-            "id": workspace.id.uuidString,
-            "title": workspace.title,
-            "current_directory": v2OrNull(mobileNonEmpty(workspace.currentDirectory)),
-            "is_selected": isSelected,
-            "is_pinned": workspace.isPinned,
-            "terminals": terminals
-        ]
-    }
-
-    private enum MobileTerminalAliasUUID {
+    enum MobileTerminalAliasUUID {
         case missing
         case value(UUID)
         case invalid
         case conflict
     }
 
-    private func mobileTerminalAliasUUID(params: [String: Any]) -> MobileTerminalAliasUUID {
+    func mobileTerminalAliasUUID(params: [String: Any]) -> MobileTerminalAliasUUID {
         var selected: UUID?
         var sawAlias = false
         for key in ["surface_id", "terminal_id", "tab_id"] {
@@ -22380,6 +22476,31 @@ class TerminalController {
         ])
     }
 
+    /// Jump the resolved mobile surface's real Mac viewport to the live bottom,
+    /// out of scrollback. The phone's jump-to-latest button routes here because
+    /// its display-only mirror has no local scrollback to pop. Notes the byte
+    /// change so a fresh render-grid frame (now carrying `atBottom == true`)
+    /// flows back and the button self-hides.
+    private func v2MobileTerminalScrollToBottom(params: [String: Any]) -> V2CallResult {
+        if let error = mobileWorkspaceIDValidationError(params: params) {
+            return error
+        }
+        if let error = mobileTerminalAliasValidationError(params: params) {
+            return error
+        }
+        guard let resolved = mobileResolveWorkspaceAndSurface(params: params, requireTerminal: true),
+              let surfaceId = resolved.surfaceId,
+              let terminalPanel = resolved.workspace.terminalPanel(for: surfaceId) else {
+            return .err(code: "not_found", message: "Terminal surface not found", data: nil)
+        }
+        terminalPanel.surface.mobileScrollToBottom()
+        MobileTerminalRenderObserver.shared.noteTerminalBytes(surfaceID: terminalPanel.id)
+        return .ok([
+            "workspace_id": resolved.workspace.id.uuidString,
+            "surface_id": surfaceId.uuidString,
+        ])
+    }
+
     private func v2MobileTerminalMouse(params: [String: Any]) -> V2CallResult {
         if let error = mobileWorkspaceIDValidationError(params: params) {
             return error
@@ -22455,9 +22576,15 @@ class TerminalController {
 
     /// Handle `terminal.paste_image`: a paired client (the iOS app) forwards an
     /// image it pasted as base64 bytes. We materialize it to a temp file on the
-    /// Mac and inject the shell-escaped path as terminal input, exactly the way a
-    /// local clipboard-image paste does, so the running TUI (e.g. Claude Code)
-    /// attaches the image from the path.
+    /// Mac and inject the shell-escaped path through Ghostty's paste path, exactly
+    /// the way a local clipboard-image paste or file drop does, so the running TUI
+    /// (e.g. Claude Code) recognizes the pasted image file path and attaches it as
+    /// `[Image #N]`.
+    ///
+    /// The delivery route matters: the path must arrive as a bracketed paste so
+    /// the prompt's paste handler runs its image-path detection. Feeding it as
+    /// typed text (the old `sendInputResult` route) skips bracketed paste, so the
+    /// path lands as a literal string and the image is never attached.
     private func v2MobileTerminalPasteImage(params: [String: Any]) -> V2CallResult {
         guard let base64 = v2RawString(params, "image_base64"),
               let imageData = Data(base64Encoded: base64), !imageData.isEmpty else {
@@ -22482,7 +22609,7 @@ class TerminalController {
             return .err(code: "invalid_params", message: "Image payload was empty or exceeded the size limit", data: nil)
         }
 
-        let sendResult = terminalPanel.surface.sendInputResult(escapedPath)
+        let sendResult = terminalPanel.surface.sendTextResult(escapedPath)
         switch sendResult {
         case .sent:
             terminalPanel.surface.forceRefresh(reason: "mobileHost.terminalPasteImage")
@@ -22814,7 +22941,7 @@ class TerminalController {
         return (tabManager, workspace, surfaceId)
     }
 
-    private func mobileTerminalPanels(in workspace: Workspace) -> [TerminalPanel] {
+    func mobileTerminalPanels(in workspace: Workspace) -> [TerminalPanel] {
         // Use the workspace's spatial (left-to-right, top-to-bottom) panel order
         // so the phone's terminal dropdown matches the on-screen bonsplit layout,
         // rather than focused-first/UUID order. `is_focused` in the payload still
@@ -22822,7 +22949,7 @@ class TerminalController {
         orderedPanels(in: workspace).compactMap { $0 as? TerminalPanel }
     }
 
-    private func mobileNonEmpty(_ raw: String?) -> String? {
+    func mobileNonEmpty(_ raw: String?) -> String? {
         let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed?.isEmpty == false ? trimmed : nil
     }

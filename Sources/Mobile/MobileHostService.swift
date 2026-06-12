@@ -293,30 +293,6 @@ final class MobileHostService {
     static let shared = MobileHostService()
     nonisolated private static let maximumActiveConnectionCount = 10
 
-    /// The single source of truth for the capabilities advertised to mobile
-    /// clients via `mobile.host.status`. Every status path (the public-status
-    /// cache, the network status gate, and `TerminalController`'s full
-    /// status) reads this so the lists cannot drift; iOS gates features
-    /// like rename/pin on the entries present here.
-    ///
-    /// This also advertises `dogfood.v1`, the agent feedback round-trip
-    /// (`dogfood.feedback.submit`). It is advertised on every build type so the
-    /// privileged Send Feedback path (offered only to `@manaflow.ai` users on an
-    /// active connection) works on Release (beta/prod) too; the sink itself is
-    /// still gated by the same-account Stack-auth check the rest of the mobile
-    /// data plane enforces.
-    nonisolated static var mobileHostCapabilities: [String] {
-        [
-            "events.v1",
-            "terminal.bytes.v1",
-            "terminal.render_grid.v1",
-            "terminal.replay.v1",
-            "terminal.viewport.v1",
-            "workspace.actions.v1",
-            "dogfood.v1",
-        ]
-    }
-
     /// The single shape every public `mobile.host.status` reply uses (the
     /// public-status cache, the network status gate, and
     /// `TerminalController`'s no-private-metadata branch), so the fields
@@ -406,6 +382,16 @@ final class MobileHostService {
     private var readinessTimeoutTask: Task<Void, Never>?
     #if DEBUG
     private var debugAcceptedStackAuthToken: String?
+    /// The current DEV dogfood checklist as opaque validated JSON (a top-level
+    /// object), set by the `dogfood_checklist_set` debug-socket command and
+    /// served to the phone via `dogfood.checklist.fetch`. The Mac never models
+    /// the schema (the phone owns the typed decode), so it stays
+    /// schema-agnostic. `nil` until the agent pushes one.
+    private var dogfoodChecklistJSON: [String: Any]?
+    /// Reject a checklist larger than this on `dogfood_checklist_set` so a hostile
+    /// or runaway client can't push a giant blob the Mac then re-serializes per
+    /// fetch.
+    nonisolated static let dogfoodChecklistMaxBytes = 65_536
     #endif
 
     private init() {}
@@ -439,6 +425,63 @@ final class MobileHostService {
         guard auth.isAuthenticated else { return nil }
         return auth.currentUser?.primaryEmail
     }
+
+    #if DEBUG
+    /// The topic the DEV dogfood checklist is pushed/served on.
+    nonisolated static let dogfoodChecklistTopic = "dogfood.checklist"
+
+    /// Set the current DEV dogfood checklist from raw JSON pushed by the agent
+    /// (the `dogfood_checklist_set` debug-socket command), then push it to every
+    /// subscribed phone over the `dogfood.checklist` event topic.
+    ///
+    /// The JSON is validated as a top-level object and size-capped, but its
+    /// schema is otherwise opaque to the Mac (the phone owns the typed decode).
+    /// - Parameter rawJSON: The checklist JSON bytes.
+    /// - Returns: `true` when stored + pushed; `false` when the JSON is
+    ///   oversized, not parseable, or not a top-level object.
+    @discardableResult
+    func setDogfoodChecklist(rawJSON: Data) -> Bool {
+        guard rawJSON.count <= Self.dogfoodChecklistMaxBytes else { return false }
+        guard let object = try? JSONSerialization.jsonObject(with: rawJSON) as? [String: Any] else {
+            return false
+        }
+        dogfoodChecklistJSON = object
+        // Push to any subscribed phone. A checklist set before a device subscribes
+        // is not lost: the phone pulls via `dogfood.checklist.fetch` on connect.
+        //
+        // Auth posture (intended): the checklist push shares the SAME same-account
+        // gate as every other event topic. `mobile.events.subscribe` is itself
+        // authorization-required (only `mobile.host.status` is exempt in
+        // `requiresAuthorization`), so no unauthenticated or cross-account client
+        // ever receives this. The scoped-attach-ticket allowance for subscribe
+        // governs workspace scope, not account identity, and the checklist is
+        // agent-authored test text with no workspace scope — strictly less
+        // sensitive than the `terminal.render_grid` / `workspace.updated` live
+        // terminal content already delivered on this same channel to those
+        // clients. The more-restrictive `dogfood.checklist.fetch` gate is
+        // incidental (every RPC defaults to authorization-required), not a
+        // stronger intended gate that the push undercuts. DEBUG-only regardless.
+        emitEvent(topic: Self.dogfoodChecklistTopic, payload: object)
+        return true
+    }
+
+    /// Clear the current DEV dogfood checklist and push an empty checklist to
+    /// every subscribed phone so the pane shows its empty state instead of a
+    /// stale checklist. `dogfood.checklist.fetch` then reports no checklist.
+    func clearDogfoodChecklist() {
+        dogfoodChecklistJSON = nil
+        // Push an explicit empty checklist (an object with an empty `items`
+        // array) so a subscribed phone applies the cleared state immediately;
+        // the typed decoder reads a missing/empty `items` as an empty checklist.
+        emitEvent(topic: Self.dogfoodChecklistTopic, payload: ["items": [Any]()])
+    }
+
+    /// The current checklist JSON object, or `nil` if none is set. Served by the
+    /// `dogfood.checklist.fetch` RPC.
+    func currentDogfoodChecklist() -> [String: Any]? {
+        dogfoodChecklistJSON
+    }
+    #endif
 
     /// Fan out a server-pushed event to every connection subscribed to `topic`.
     /// Safe to call from any actor/queue.
@@ -1384,6 +1427,12 @@ final class MobileHostService {
             return nil
         case "workspace.create":
             return nil
+        case "workspace.group.collapse", "workspace.group.expand":
+            // Display-only group state. Keyed by `group_id` (not a workspace or
+            // terminal selection), so it is Mac-scoped like the workspace list and
+            // not constrained by the ticket's workspace/terminal pin. The Stack
+            // same-account gate in `authorizationError` remains authoritative.
+            return nil
         case "mobile.terminal.create", "terminal.create":
             return nil
         case "mobile.terminal.input", "terminal.input",
@@ -2166,13 +2215,21 @@ actor MobileHostConnection {
             guard !topics.isEmpty else {
                 return .failure(MobileHostRPCError(code: "invalid_params", message: "topics is required"))
             }
+            // Report whether this stream id was already registered BEFORE the
+            // idempotent replace. The phone's render-grid liveness probe
+            // re-asserts its subscription on prolonged silence; `false` tells
+            // it the registration had been lost (events emitted in the gap
+            // were never delivered), so it requests a catch-up replay instead
+            // of trusting delta continuity.
+            let alreadySubscribed = subscriptions[streamID] != nil
             subscribe(streamID: streamID, topics: topics)
             #if DEBUG
-            cmuxDebugLog("mobile.subscribe streamID=\(streamID) topics=\(topics.sorted()) connID=\(self.id.uuidString)")
+            cmuxDebugLog("mobile.subscribe streamID=\(streamID) topics=\(topics.sorted()) existing=\(alreadySubscribed) connID=\(self.id.uuidString)")
             #endif
             return .ok([
                 "stream_id": streamID,
                 "topics": Array(topics).sorted(),
+                "already_subscribed": alreadySubscribed,
             ])
         case "mobile.events.unsubscribe":
             let streamID = request.params["stream_id"] as? String ?? ""
@@ -2188,7 +2245,13 @@ actor MobileHostConnection {
 
     private static func isInteractiveMobileRequest(_ method: String) -> Bool {
         switch method {
-        case "mobile.host.status", "mobile.terminal.replay", "terminal.replay":
+        case "mobile.host.status", "mobile.terminal.replay", "terminal.replay",
+             // Subscription management is plumbing, not user interaction: the
+             // phone's render-grid liveness watchdog re-asserts its
+             // subscription on every silence window (~9s when idle), and
+             // counting that as interactive activity starves host work gated
+             // on mobile quiet (e.g. TabManager background git/PR refresh).
+             "mobile.events.subscribe", "mobile.events.unsubscribe":
             return false
         default:
             return true

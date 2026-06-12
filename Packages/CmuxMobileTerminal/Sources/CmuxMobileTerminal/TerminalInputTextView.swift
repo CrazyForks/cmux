@@ -1,19 +1,75 @@
 import CMUXMobileCore
+import CmuxMobileDiagnostics
 import CmuxMobileTerminalKit
 import Foundation
 import UIKit
 
-final class TerminalInputTextView: UITextView {
+/// The iOS terminal's keyboard input surface.
+///
+/// This is a **documentless responder**, not a text editor. It conforms to
+/// ``UIKeyInput`` and ``UITextInput`` directly on a bare `UIView` (the same
+/// construction iSH's `TerminalView` and vvterm's IME proxy ship) instead of
+/// subclassing `UITextView`. Every committed character is forwarded to the
+/// remote Mac and nothing is echoed locally, so there is no editable buffer to
+/// keep in sync — the view owns only a transient IME ``markedText`` string plus
+/// a zero-width *delete-repeat anchor* (see ``usesDeleteRepeatAnchor``).
+///
+/// ## Why not a `UITextView`
+///
+/// A `UITextView` (or any real-document field) drives backspace auto-repeat and
+/// dictation off its internal text storage and selection, not off
+/// ``UIKeyInput/hasText``. The previous implementation forced `hasText` to
+/// `true` but cleared its document to `""` after every keystroke, so:
+///
+/// - **hold-to-repeat backspace** stopped after one delete: with an empty
+///   document and a collapsed selection at offset 0 the framework had nothing to
+///   repeat-delete, and a `UITextView` never consults the overridden `hasText`
+///   for repeat.
+/// - **system dictation** never landed: dictation inserts a placeholder into the
+///   document then replaces it with the recognized text, but the per-keystroke
+///   `text = ""` clear nuked the placeholder mid-flight.
+///
+/// A bare ``UIKeyInput``/``UITextInput`` responder with no document has neither
+/// problem. The framework honors ``hasText`` for repeat on a raw responder, the
+/// view presents vvterm's toggling one-character zero-width document so UIKit's
+/// modern document-driven repeat path also keeps firing, and the explicit
+/// dictation-placeholder methods on a real (non-cleared) `UITextInput` conformer
+/// let recognized text arrive through ``insertText(_:)`` as one block, which
+/// routes to the bracketed-paste sink.
+///
+/// Autocorrect/predictive text stay **disabled** here and fundamentally cannot
+/// be enabled: they require the field to retain the in-progress word, which is
+/// incompatible with forwarding every keystroke to a remote terminal.
+final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     var onText: ((String) -> Void)?
     var onBackspace: (() -> Void)?
     var onEscapeSequence: ((Data) -> Void)?
+    /// Invoked for a committed *block* of text (more than one character) that no
+    /// modifier transforms: system dictation, autocorrect/predictive-bar
+    /// replacements, and clipboard text inserted by the keyboard all arrive this
+    /// way. The host routes the block through a bracketed-paste RPC so the remote
+    /// terminal receives it as a single paste rather than per-character input,
+    /// which avoids CR-fragmenting multi-line text and lets TUIs treat it as
+    /// pasted content. Single characters and Return still ride ``onText``.
+    var onPasteText: ((String) -> Void)?
     /// Invoked when the Paste accessory button reads an image off the system
     /// clipboard. The host forwards the bytes (+ a lowercase format hint) to the
     /// Mac, which injects the resulting file path into the terminal. Clipboard
     /// *text* does not use this path; it rides ``onText``.
     var onPasteImage: ((Data, String) -> Void)?
+    /// Fired when a pasted image is too large to send even after trying a
+    /// compressed JPEG fallback, so the host can surface a "too large" notice
+    /// instead of the paste silently doing nothing.
+    var onPasteImageTooLarge: (() -> Void)?
     var onZoom: ((TerminalFontZoomDirection) -> Void)?
     var onHideKeyboard: (() -> Void)?
+    /// Structured diagnostic log (DEBUG dogfood builds only) for the
+    /// hold-backspace + dictation evidence round. Property-injected by
+    /// ``GhosttySurfaceView`` from the shell store's `diagnosticLog` so the
+    /// "Send to agent" feedback pane captures input-path events. `nil` in release
+    /// and in any host that does not wire it; every probe is a no-op then. The
+    /// integer payloads are decoded by `scripts/decode-ios-diagnostic.py`.
+    var diagnosticLog: DiagnosticLog?
     /// Fired by the trailing "customize" button so the SwiftUI host can present
     /// the toolbar shortcuts editor.
     var onOpenToolbarSettings: (() -> Void)?
@@ -21,8 +77,11 @@ final class TerminalInputTextView: UITextView {
     /// the iMessage-style composer above the terminal.
     var onToggleComposer: (() -> Void)?
     /// Fired by the pinned HIDE button: temporarily hides the toolbar + composer
-    /// until the next terminal tap.
+    /// until the next terminal tap (item 2).
     var onHideChrome: (() -> Void)?
+    /// Fired by the attachments button: the host presents the iOS photo/file picker
+    /// and routes a picked image through the existing image-attach path (item 5).
+    var onOpenAttachments: (() -> Void)?
     var accessoryLayoutInsetsProvider: (() -> UIEdgeInsets)?
     /// The leftmost toolbar button. Toggles its glyph between dismiss-keyboard
     /// (when the keyboard is up) and show-keyboard (when down) via
@@ -44,22 +103,176 @@ final class TerminalInputTextView: UITextView {
     private var alternateAccessorySticky: Bool { modifierState.isStickyOn(.alternate) }
     private var commandAccessorySticky: Bool { modifierState.isStickyOn(.command) }
     private var shiftAccessorySticky: Bool { modifierState.isStickyOn(.shift) }
-    private var pendingDirectInsertMirrorText = ""
+
+    /// The in-progress IME composition string, or `nil` when not composing.
+    ///
+    /// This is the view's only *committed* text state. While an IME (CJK,
+    /// emoji-via-IME) is composing, UIKit calls
+    /// ``setMarkedText(_:selectedRange:)`` with the candidate; the view holds it
+    /// here so ``markedTextRange`` reports active composition and ``text(in:)``
+    /// can answer the framework's read-back. On ``unmarkText()`` the held string
+    /// commits through ``insertText(_:)`` and this clears. There is no
+    /// committed-document buffer.
+    private var markedText: String?
+
+    /// Toggles the zero-width character used for the delete-repeat anchor on each
+    /// empty-buffer ``deleteBackward()``. Alternating between two distinct
+    /// zero-width characters guarantees the virtual document's *contents* change
+    /// every delete, which (alongside the `inputDelegate` text-change brackets)
+    /// re-arms UIKit's document-driven backspace repeat. Borrowed verbatim from
+    /// vvterm's `deleteRepeatAnchorUsesAlternate`.
+    private var deleteRepeatAnchorUsesAlternate = false
 
     /// Monotonic-ish tap timestamp for the reducer's double-tap window. Uses
     /// the same wall-clock source the legacy `Date()` comparisons used, so the
     /// 0.4s sticky promotion behaves identically.
     private static func tapNow() -> TimeInterval { Date().timeIntervalSinceReferenceDate }
-    private static let directInsertMirrorTextLimit = 128
+
+    /// The framework-supplied delegate that wants to know about marked/selection
+    /// changes. Required by the ``UITextInput`` conformance; the view notifies it
+    /// around ``setMarkedText(_:selectedRange:)`` and around each empty-buffer
+    /// delete (the anchor re-arm) so the keyboard's composition and repeat
+    /// machinery stay synchronized.
+    weak var inputDelegate: (any UITextInputDelegate)?
+
+    /// Word/sentence tokenizer required by ``UITextInput``. The view has no real
+    /// document to tokenize, but the protocol mandates a non-nil tokenizer; the
+    /// default string tokenizer satisfies it without ever being meaningfully
+    /// queried.
+    lazy var tokenizer: any UITextInputTokenizer = UITextInputStringTokenizer(textInput: self)
 
     override var canBecomeFirstResponder: Bool { true }
 
+    /// Records the outcome of becoming first responder for the hold-backspace +
+    /// dictation evidence round, then defers to the default. `super` already does
+    /// the real work; this only stamps the result into ``diagnosticLog`` (DEBUG
+    /// dogfood builds) so the captured log shows whether this proxy actually owns
+    /// first responder when the keyboard is up — the load-bearing question behind
+    /// the "is `TerminalInputTextView` even being driven" hypothesis.
+    @discardableResult
+    override func becomeFirstResponder() -> Bool {
+        let became = super.becomeFirstResponder()
+        #if DEBUG
+        let responder = CurrentResponderProbe().current()
+        let identity = Self.responderIdentity(of: responder)
+        diagnosticLog?.record(DiagnosticEvent(
+            .inputBecomeFirstResponder,
+            a: became ? 1 : 0,
+            b: identity.rawValue
+        ))
+        MobileDebugLog.anchormux(
+            "input.becomeFirstResponder became=\(became) identity=\(identity) class=\(Self.responderClassName(responder)) onSelf=\(responder === self)"
+        )
+        #endif
+        return became
+    }
+
+    /// Conforming to ``UITextInput`` would otherwise make this an accessibility
+    /// element, which would shadow the real terminal surface's accessibility
+    /// content. The view is an invisible input proxy, so keep it out of the
+    /// accessibility tree (the surface carries the rendered-text label). iSH does
+    /// the same for the same reason.
+    override var isAccessibilityElement: Bool {
+        get { false }
+        set {}
+    }
+
     override var keyCommands: [UIKeyCommand]? {
-        guard markedTextRange == nil else { return nil }
-        return TerminalHardwareKeyResolver.makeKeyCommands(
+        guard markedText == nil else { return nil }
+        var commands = TerminalHardwareKeyResolver.makeKeyCommands(
             target: self,
             action: #selector(handleHardwareKeyCommand(_:))
         )
+        // A bare UIView does not inherit UITextView's Cmd+V, so wire it
+        // explicitly to the same clipboard routing as the toolbar Paste button.
+        commands.append(UIKeyCommand(input: "v", modifierFlags: [.command], action: #selector(paste(_:))))
+        return commands
+    }
+
+    /// Restores standard system paste on this documentless responder.
+    ///
+    /// As a `UITextView` the view inherited `paste(_:)`/`canPerformAction(_:)`;
+    /// as a bare `UIView` it must re-expose them so hardware Cmd+V and the
+    /// edit-menu Paste keep working. Only paste is advertised — copy/cut/select
+    /// are meaningless on a proxy that holds no document, so they stay disabled
+    /// rather than surfacing a broken edit menu.
+    override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
+        if action == #selector(paste(_:)) {
+            return UIPasteboard.general.hasStrings || UIPasteboard.general.hasImages
+        }
+        return false
+    }
+
+    /// System Paste (Cmd+V or the edit-menu item) routed through the same
+    /// clipboard handling as the toolbar Paste button: an image goes to the Mac
+    /// as `terminal.paste_image`, text rides the bracketed-paste sink.
+    override func paste(_ sender: Any?) {
+        handlePasteAction()
+    }
+
+    // MARK: Hold-to-repeat backspace (hasText + zero-width anchor)
+
+    /// Always report that there is text to delete.
+    ///
+    /// This is the legacy ``UIKeyInput`` gate (borrowed from iSH's
+    /// `TerminalView`) for the software keyboard's *hold-to-repeat* backspace. On
+    /// a bare ``UIKeyInput`` responder (this view) the keyboard's auto-repeat
+    /// timer keeps firing ``deleteBackward()`` only while the first responder
+    /// reports `hasText == true`. It is always safe to send a DEL byte to the
+    /// remote terminal, so there is no "nothing to delete" state to honor —
+    /// return `true` unconditionally.
+    ///
+    /// Internal byte-routing therefore must *not* key off `hasText` (it is a
+    /// constant); ``deleteBackward()`` and the modifier guards key off
+    /// ``markedText`` (IME composition) instead.
+    var hasText: Bool { true }
+
+    /// Whether the view is currently presenting the zero-width delete-repeat
+    /// anchor: there is no IME composition, so the view fabricates a
+    /// one-character virtual document with the caret at the end. While this is
+    /// true UIKit's modern document-driven repeat path sees a deletable character
+    /// to the left of the cursor and keeps firing ``deleteBackward()``. Mirrors
+    /// vvterm's `usesDeleteRepeatAnchor`.
+    private var usesDeleteRepeatAnchor: Bool { markedText == nil }
+
+    /// The current zero-width anchor character. Toggling between two distinct
+    /// zero-width characters on each empty-buffer delete forces the virtual
+    /// document's contents to change, which is what re-arms the repeat. (vvterm:
+    /// `deleteRepeatAnchorText`.)
+    private var deleteRepeatAnchorText: String {
+        deleteRepeatAnchorUsesAlternate ? "\u{2060}" : "\u{200B}"
+    }
+
+    /// The virtual document UIKit walks: the IME composition while marking,
+    /// otherwise the one-character zero-width delete-repeat anchor.
+    private var textInputDocument: String {
+        usesDeleteRepeatAnchor ? deleteRepeatAnchorText : (markedText ?? "")
+    }
+
+    private var textInputDocumentLength: Int {
+        (textInputDocument as NSString).length
+    }
+
+    /// The caret sits at the end of the virtual document (after the anchor char,
+    /// or at the end of the marked composition) so there is always something to
+    /// its left to delete.
+    private var effectiveSelectedRange: NSRange {
+        NSRange(location: textInputDocumentLength, length: 0)
+    }
+
+    /// Re-arm the delete-repeat anchor after an empty-buffer delete.
+    ///
+    /// Toggling the anchor char inside `textWillChange`/`textDidChange` brackets
+    /// tells UIKit the (still one-character) virtual document changed, so the
+    /// keyboard's document-driven repeat timer re-reads it and fires the next
+    /// ``deleteBackward()``. Without this the modern repeat path stalls after one
+    /// delete even though ``hasText`` stays `true` — this is the refinement the
+    /// prior documentless attempt lacked. Mirrors vvterm's
+    /// `notifyVirtualDeleteAnchorDidChange`.
+    private func notifyVirtualDeleteAnchorDidChange() {
+        inputDelegate?.textWillChange(self)
+        deleteRepeatAnchorUsesAlternate.toggle()
+        inputDelegate?.textDidChange(self)
     }
 
     private static let monokaiBarColor = UIColor(red: 0x27/255.0, green: 0x28/255.0, blue: 0x22/255.0, alpha: 1)
@@ -256,8 +469,8 @@ final class TerminalInputTextView: UITextView {
             // Pinned composer toggle: directly after the nub (same 6pt gap the
             // scroll view used to take), centered on the shared strip line. The
             // scroll view starts after it with the 4pt inter-button spacing the
-            // stack uses, so the bar reads identically to before — only now the
-            // composer can never scroll away.
+            // stack used between the composer and attachments, so the bar reads
+            // identically to before — only now the composer can never scroll away.
             composerButton.leadingAnchor.constraint(equalTo: nub.trailingAnchor, constant: 6),
             composerButton.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
 
@@ -350,13 +563,13 @@ final class TerminalInputTextView: UITextView {
         }
     }
 
-    /// Build (or rebuild) the SCROLLABLE button row: the user's configured order
-    /// (modifiers, zoom, paste, shortcuts, and custom actions all reorderable
-    /// together), followed by the fixed trailing HIDE and "customize" controls.
-    /// The composer toggle is NOT here — it is pinned in the container outside
-    /// the scroll view (see ``terminalAccessoryToolbar``). The ⌘ item is rendered
-    /// only when driving a Mac remote. Safe to call repeatedly; it clears the
-    /// stack first.
+    /// Build (or rebuild) the SCROLLABLE button row: a leading attachments button,
+    /// then the user's configured order (modifiers, zoom, paste, shortcuts, and
+    /// custom actions all reorderable together), followed by the fixed trailing
+    /// "customize" control. The composer toggle is NOT here — it is pinned in the
+    /// container outside the scroll view (see ``terminalAccessoryToolbar``). The ⌘
+    /// item is rendered only when driving a Mac remote. Safe to call repeatedly; it
+    /// clears the stack first.
     private func populateAccessoryActions() {
         guard let stack = accessoryStackView else { return }
         for view in stack.arrangedSubviews {
@@ -370,6 +583,12 @@ final class TerminalInputTextView: UITextView {
         // position. It is built once at toolbar construction (not config/remote
         // dependent), so a repopulate must not re-add or rebuild it.
         //
+        // The attachments button, the bar's first scrollable item: opens the iOS
+        // photo/file picker and routes a picked image through the existing image-attach
+        // path (item 5). Not a configurable shortcut, so it is pinned at the leading
+        // edge of the reorderable region rather than listed inside it.
+        stack.addArrangedSubview(makeAttachmentsButton())
+
         // The user-configurable region: built-in shortcuts/modifiers/zoom/paste
         // and custom actions, all in the user's saved order.
         for item in TerminalAccessoryConfiguration.shared.enabledItems {
@@ -472,26 +691,16 @@ final class TerminalInputTextView: UITextView {
     }
 
     init() {
-        super.init(frame: .zero, textContainer: nil)
+        super.init(frame: .zero)
         backgroundColor = .clear
-        textColor = .clear
         tintColor = .clear
-        autocorrectionType = .no
-        autocapitalizationType = .none
-        smartQuotesType = .no
-        smartDashesType = .no
-        smartInsertDeleteType = .no
-        spellCheckingType = .no
-        keyboardType = .default
-        returnKeyType = .default
-        textContainerInset = .zero
-        // The accessory bar is no longer the keyboard's `inputAccessoryView`;
-        // `GhosttySurfaceView` docks `toolbarView` persistently at the bottom so
-        // it survives keyboard dismissal. Leaving `inputAccessoryView` nil means
-        // the keyboard shows without its own accessory (the docked bar rides
-        // above it via `keyboardLayoutGuide`).
-        delegate = self
-        text = ""
+        // The view owns no visible content; it is a zero-size hidden responder
+        // docked by `GhosttySurfaceView`. The accessory bar is no longer the
+        // keyboard's `inputAccessoryView`; `GhosttySurfaceView` docks
+        // `toolbarView` persistently at the bottom so it survives keyboard
+        // dismissal. Leaving `inputAccessoryView` nil means the keyboard shows
+        // without its own accessory (the docked bar rides above it via
+        // `keyboardLayoutGuide`).
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleAccessoryConfigurationChanged),
@@ -508,20 +717,60 @@ final class TerminalInputTextView: UITextView {
         NotificationCenter.default.removeObserver(self)
     }
 
-    override func insertText(_ text: String) {
+    /// Receive a committed character (or block) from the keyboard.
+    ///
+    /// This is the single sink for every soft-keyboard text insertion: typed
+    /// characters, an emoji-picker tap, an IME-committed candidate, and the
+    /// recognized text of a dictation session (delivered as one multi-character
+    /// block). It never edits a local document — it routes straight to the
+    /// remote terminal. Committing here also ends any IME composition.
+    func insertText(_ text: String) {
         guard !text.isEmpty else { return }
-        TerminalInputDebugLog.log("proxy.insertText text=\(TerminalInputDebugLog.textSummary(text)) composing=\(markedTextRange != nil)")
-        if markedTextRange != nil {
-            pendingDirectInsertMirrorText = ""
-            super.insertText(text)
-            return
+        #if DEBUG
+        // A dictation result arrives here as one multi-character block, so a
+        // non-trivial `a` (UTF-8 byte length) after a mic tap proves dictation
+        // fired and reached this view. `b` flags an active IME composition.
+        diagnosticLog?.record(DiagnosticEvent(
+            .inputInsertText,
+            a: text.utf8.count,
+            b: markedText != nil ? 1 : 0
+        ))
+        MobileDebugLog.anchormux("input.insertText len=\(text.utf8.count) composing=\(markedText != nil)")
+        #endif
+        TerminalInputDebugLog.log("proxy.insertText text=\(TerminalInputDebugLog.textSummary(text)) composing=\(markedText != nil)")
+        // A committed insert ends composition. The candidate the IME was showing
+        // is exactly `text`, so clear the marked state and emit `text` once.
+        if markedText != nil {
+            withMarkedTextChange { markedText = nil }
         }
-        rememberDirectInsertMirror(text)
         emitCommittedText(text, source: "insertText")
     }
 
-    override func deleteBackward() {
-        if commandAccessoryArmed, markedTextRange == nil, !hasText {
+    func deleteBackward() {
+        #if DEBUG
+        // Logged on EVERY call (not just the first): a held backspace that
+        // auto-repeats shows as many events; one that does not shows as a single
+        // event. `a` carries the responder identity at the moment of the delete
+        // (resolved from the live responder chain, so a focus-steal between
+        // keyboard-up and the keystroke is visible, not assumed).
+        let deleteResponder = CurrentResponderProbe().current()
+        let deleteIdentity = Self.responderIdentity(of: deleteResponder)
+        diagnosticLog?.record(DiagnosticEvent(
+            .inputDeleteBackward,
+            a: deleteIdentity.rawValue,
+            b: markedText != nil ? 1 : 0
+        ))
+        MobileDebugLog.anchormux(
+            "input.deleteBackward identity=\(deleteIdentity) class=\(Self.responderClassName(deleteResponder)) onSelf=\(deleteResponder === self) composing=\(markedText != nil)"
+        )
+        #endif
+        TerminalInputDebugLog.log("proxy.deleteBackward composing=\(markedText != nil) ctrl=\(controlAccessoryArmed) alt=\(alternateAccessoryArmed) cmd=\(commandAccessoryArmed)")
+        // Routing keys off `markedText` (IME composition in progress), NOT
+        // `hasText`: `hasText` is a forced constant `true` so the software
+        // keyboard auto-repeats backspace, so it can no longer mean "the local
+        // document is empty". While composing, the delete cancels the
+        // composition; otherwise it is a real backspace that must reach the Mac.
+        if commandAccessoryArmed, markedText == nil {
             if !commandAccessorySticky {
                 setCommandAccessoryArmed(false)
             }
@@ -529,7 +778,7 @@ final class TerminalInputTextView: UITextView {
             onEscapeSequence?(Data([0x15]))
             return
         }
-        if alternateAccessoryArmed, markedTextRange == nil, !hasText {
+        if alternateAccessoryArmed, markedText == nil {
             if !alternateAccessorySticky {
                 setAlternateAccessoryArmed(false)
             }
@@ -541,23 +790,68 @@ final class TerminalInputTextView: UITextView {
             }
             return
         }
-        if controlAccessoryArmed, markedTextRange == nil, !hasText {
+        if controlAccessoryArmed, markedText == nil {
             if !controlAccessorySticky {
                 setControlAccessoryArmed(false)
             }
             onBackspace?()
             return
         }
-        if markedTextRange != nil || hasText {
-            super.deleteBackward()
+        // While composing (marked text present), cancel the composition rather
+        // than self-editing the marked string. The IME owns decomposition and
+        // drives it through `setMarkedText` (the candidate shown is the IME's own
+        // floating bar; this view is invisible, so `markedText` is just a mirror
+        // of what the IME last pushed). A documentless view cannot decompose a
+        // syllable itself, and modeling it as a Swift `Character` drop would nuke
+        // a whole CJK syllable (한 is one `Character`) while pretending to step
+        // back. Canceling is honest and emits nothing to the Mac; an IME that
+        // routes composition-backspace through here gets a clean reset.
+        if markedText != nil {
+            // Distinguishes the rarely-hit `deleteBackward`-drives-composition
+            // path from the common IME-driven `setMarkedText` path during device
+            // dogfood (gated on CMUX_INPUT_DEBUG; not a temporary probe).
+            TerminalInputDebugLog.log("deleteBackward.composing cancel marked composition")
+            setMarkedText(nil, selectedRange: NSRange(location: 0, length: 0))
             return
         }
+        // Empty buffer: this is a real backspace. Send DEL to the Mac and re-arm
+        // the zero-width delete-repeat anchor so UIKit's document-driven repeat
+        // keeps firing while the key is held.
+        notifyVirtualDeleteAnchorDidChange()
         onBackspace?()
     }
 
+    // MARK: Dictation
+    //
+    // This view is a bare `UIView` conforming to `UITextInput` (the same
+    // construction as iSH's `TerminalView`), so it must supply the dictation
+    // placeholder hooks itself — see ``insertDictationResultPlaceholder()`` and
+    // ``removeDictationResultPlaceholder(_:willInsertResult:)`` in the
+    // `UITextInput` conformance below. When the user taps the keyboard mic,
+    // UIKit asks for a placeholder, runs recognition, then delivers the
+    // recognized text through ``insertText(_:)`` as one multi-character block,
+    // which ``emitCommittedText(_:source:)`` routes to the bracketed-paste sink
+    // (``onPasteText``). Because the view keeps no document, nothing can clear
+    // the placeholder mid-flight, which is what broke dictation on the prior
+    // `UITextView` design.
+
+    /// Test seam standing in for an IME/dictation/commit cycle.
+    ///
+    /// Drives the same path the keyboard would: composing text marks it (so
+    /// ``markedText`` is held and the anchor is suppressed), while a
+    /// non-composing change commits it. Mirrors the real
+    /// ``setMarkedText(_:selectedRange:)`` → ``insertText(_:)`` flow so tests can
+    /// assert routing without a live keyboard.
     func simulateTextChangeForTesting(_ text: String, isComposing: Bool) {
-        self.text = text
-        handleTextChange(currentText: text, isComposing: isComposing)
+        if isComposing {
+            setMarkedText(text, selectedRange: NSRange(location: text.count, length: 0))
+        } else {
+            if markedText != nil {
+                withMarkedTextChange { markedText = nil }
+            }
+            guard !text.isEmpty else { return }
+            emitCommittedText(text, source: "textChange")
+        }
     }
 
     func simulateHardwareKeyCommandForTesting(input: String, modifierFlags: UIKeyModifierFlags) -> Bool {
@@ -621,6 +915,11 @@ final class TerminalInputTextView: UITextView {
         onHideChrome?()
     }
 
+    @objc
+    private func handleOpenAttachments() {
+        onOpenAttachments?()
+    }
+
     /// Fire a custom action's bytes. Custom actions are macros, so any armed
     /// modifier is cleared first to avoid silently modifying the macro's output.
     private func handleCustomAction(_ custom: CustomToolbarAction) {
@@ -648,12 +947,15 @@ final class TerminalInputTextView: UITextView {
         applyAccessoryButtonStyle(button, item: .builtin(action), armed: false, sticky: false)
         button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
         if action.isModifier || action.symbolName != nil {
-            // Single-glyph modifiers (⌃⌥⌘⇧) and icon buttons (zoom) get a fixed
-            // width so they stay uniform — their glyph metrics differ, and a
-            // greater-than-or-equal min-width let some (e.g. the glass capsule)
-            // grow wider than others. Variable-text buttons keep growing.
+            // Single-glyph modifiers (⌃⌥⌘⇧) and icon buttons (zoom/composer/paste)
+            // get a fixed width so they stay uniform — their glyph metrics differ,
+            // and a greater-than-or-equal min-width let some (e.g. the glass
+            // capsule) grow wider than others. Variable-text buttons keep growing.
             button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
         } else {
+            // Text buttons (Tab, Esc, ^C, ^D) hug their intrinsic content (label +
+            // the shared compact inset) and only floor at the tap-target minimum,
+            // so they are as narrow as their text allows.
             button.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.accessoryButtonMinWidth).isActive = true
         }
         return button
@@ -680,11 +982,35 @@ final class TerminalInputTextView: UITextView {
         return button
     }
 
+    /// The attachments button. A plain `UIButton` (not an ``AccessoryActionButton``)
+    /// so the armed-modifier styling/relabel loops skip it. Styled as a glass glyph key
+    /// to match the other icon buttons; tapping it asks the host to present the iOS
+    /// photo/file picker, which routes a picked image through the existing image-attach
+    /// path (item 5). Min-width matches the glyph keys so it stays uniform.
+    private func makeAttachmentsButton() -> UIButton {
+        let button = UIButton(type: .system)
+        button.translatesAutoresizingMaskIntoConstraints = false
+        button.addTarget(self, action: #selector(handleOpenAttachments), for: .touchUpInside)
+        button.accessibilityIdentifier = "terminal.inputAccessory.attachments"
+        button.accessibilityLabel = String(
+            localized: "terminal.input_accessory.attachments",
+            defaultValue: "Add Attachment"
+        )
+        var config = Self.accessoryButtonConfiguration(armed: false, sticky: false)
+        config.image = UIImage(systemName: "paperclip")
+        config.preferredSymbolConfigurationForImage = Self.accessoryButtonSymbolConfig
+        config.contentInsets = Self.accessoryButtonContentInsets
+        button.configuration = config
+        button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
+        button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
+        return button
+    }
+
     /// The HIDE button. A plain `UIButton` (not an ``AccessoryActionButton``) so the
     /// armed-modifier styling/relabel loops skip it. Styled as a de-emphasized control
     /// like "customize"; tapping it temporarily hides the whole bottom chrome (toolbar
-    /// + composer) until the next terminal tap. Min-width matches the glyph keys so it
-    /// stays uniform.
+    /// + composer) until the next terminal tap (item 2). Min-width matches the glyph
+    /// keys so it stays uniform.
     private func makeHideChromeButton() -> UIButton {
         let button = UIButton(type: .system)
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -729,6 +1055,7 @@ final class TerminalInputTextView: UITextView {
         button.configuration = config
         button.tintColor = UIColor(white: 0.7, alpha: 1)
         button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
+        // Icon-only control: fixed width so it matches the other glyph keys.
         button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
         return button
     }
@@ -900,30 +1227,52 @@ final class TerminalInputTextView: UITextView {
 
     /// Read the system clipboard for the Paste button. An image is forwarded via
     /// ``onPasteImage`` (the host uploads it to the Mac as `terminal.paste_image`
-    /// and the Mac injects the resulting file path); plain text rides the normal
-    /// ``onText`` input path. Images win when both are present. A large image
-    /// falls back to JPEG so it stays under the Mac's 10 MB cap. Accessing the
-    /// pasteboard contents here is what shows iOS's one-shot paste banner, which
-    /// is the expected confirmation for an explicit Paste tap.
+    /// and the Mac injects the resulting file path); plain text rides the
+    /// bracketed-paste ``onPasteText`` path (falling back to ``onText`` on a host
+    /// that does not support it) so multi-line clipboard text lands as one paste
+    /// instead of executing line-by-line. Images win when both are present.
+    /// Accessing the pasteboard contents here is what shows iOS's one-shot paste
+    /// banner, which is the expected confirmation for an explicit Paste tap.
+    ///
+    /// The image must fit the mobile sync frame budget once base64-encoded, so we
+    /// try PNG first, then a compressed JPEG, and send the first candidate whose
+    /// actual serialized size fits via ``MobilePasteImageSizing/fits(imageData:)``.
+    /// The base64 frame cap (~8 MB), not the Mac's 10 MB raw clipboard cap, is the
+    /// binding limit because base64 inflates the bytes ~4/3 before they are sent.
+    /// The encoders run lazily and a non-fitting encoding is released before the
+    /// next is produced, so we never hold both the PNG and the JPEG fallback at
+    /// once (a large pasteboard image could otherwise spike memory). If neither
+    /// encoding fits we drop the image and fire ``onPasteImageTooLarge`` so the
+    /// host can tell the user, rather than failing silently.
     private func handlePasteAction() {
         let pasteboard = UIPasteboard.general
         if pasteboard.hasImages, let image = pasteboard.image {
-            let maxImageBytes = 8 * 1024 * 1024
-            if let png = image.pngData(), png.count <= maxImageBytes {
-                onPasteImage?(png, "png")
-                return
+            let sizing = MobilePasteImageSizing()
+            // Measure-then-send: a brief double-encode on an explicit user paste is
+            // fine; this is not a hot path and the lazy encoders keep peak memory
+            // to one encoding at a time.
+            if let fitting = sizing.firstEncodingThatFits([
+                (label: "png", encode: { image.pngData() }),
+                (label: "jpg", encode: { image.jpegData(compressionQuality: 0.8) }),
+            ]) {
+                onPasteImage?(fitting.data, fitting.label)
+            } else {
+                // We have an image but no encoding fits the frame budget; tell the
+                // user instead of silently sending nothing or pasting text.
+                onPasteImageTooLarge?()
             }
-            if let jpeg = image.jpegData(compressionQuality: 0.8) {
-                onPasteImage?(jpeg, "jpg")
-                return
-            }
-            if let png = image.pngData() {
-                onPasteImage?(png, "png")
-                return
-            }
+            return
         }
         if pasteboard.hasStrings, let string = pasteboard.string, !string.isEmpty {
-            onText?(string)
+            // An explicit Paste is always pasted content, so it goes through the
+            // bracketed-paste sink (which falls back to per-key input on a host
+            // that does not support it). The host gates the fallback on the
+            // `terminal.paste.v1` capability.
+            if onPasteText != nil {
+                onPasteText?(string)
+            } else {
+                onText?(string)
+            }
         }
     }
 
@@ -968,40 +1317,6 @@ final class TerminalInputTextView: UITextView {
         }
     }
 
-    private func handleTextChange(currentText: String, isComposing: Bool) {
-        TerminalInputDebugLog.log("proxy.textChange text=\(TerminalInputDebugLog.textSummary(currentText)) composing=\(isComposing) pendingDirect=\(TerminalInputDebugLog.textSummary(pendingDirectInsertMirrorText))")
-        if isComposing {
-            pendingDirectInsertMirrorText = ""
-        } else if !pendingDirectInsertMirrorText.isEmpty {
-            if currentText == pendingDirectInsertMirrorText {
-                TerminalInputDebugLog.log("proxy.textChange suppressed direct insert mirror text=\(TerminalInputDebugLog.textSummary(currentText))")
-                pendingDirectInsertMirrorText = ""
-                if text != "" {
-                    text = ""
-                }
-                return
-            }
-            pendingDirectInsertMirrorText = ""
-        }
-
-        let result = TerminalTextInputPipeline.process(text: currentText, isComposing: isComposing)
-        if let committedText = result.committedText {
-            emitCommittedText(committedText, source: "textChange")
-        }
-        if text != result.nextBufferText {
-            text = result.nextBufferText
-        }
-    }
-
-    private func rememberDirectInsertMirror(_ insertedText: String) {
-        pendingDirectInsertMirrorText.append(insertedText)
-        if pendingDirectInsertMirrorText.count > Self.directInsertMirrorTextLimit {
-            pendingDirectInsertMirrorText = String(
-                pendingDirectInsertMirrorText.suffix(Self.directInsertMirrorTextLimit)
-            )
-        }
-    }
-
     private func emitCommittedText(_ committedText: String, source: String) {
         TerminalInputDebugLog.log("proxy.emit source=\(source) text=\(TerminalInputDebugLog.textSummary(committedText))")
         if controlAccessoryArmed {
@@ -1035,9 +1350,47 @@ final class TerminalInputTextView: UITextView {
             if !shiftAccessorySticky {
                 setShiftAccessoryArmed(false)
             }
-            onText?(committedText.uppercased())
+            emitUnmodifiedText(committedText.uppercased())
         } else {
-            onText?(committedText)
+            emitUnmodifiedText(committedText)
+        }
+    }
+
+    /// Route a committed block with no active modifier to either the per-key
+    /// input path or the bracketed-paste path.
+    ///
+    /// Single characters and Return keep riding ``onText`` so byte semantics
+    /// (CR for Return, control bytes, the existing per-keystroke flow) are
+    /// unchanged. A multi-character block — system dictation, an
+    /// autocorrect/predictive replacement, or keyboard-inserted clipboard text —
+    /// is sent through ``onPasteText`` so it reaches the remote terminal as one
+    /// bracketed paste instead of fragmenting on embedded newlines.
+    private func emitUnmodifiedText(_ text: String) {
+        switch TerminalCommitRouter.route(for: text) {
+        case .paste where onPasteText != nil:
+            #if DEBUG
+            // The path a dictation result (multi-character, no modifier) takes:
+            // bracketed paste. Pairing this with ``inputInsertText`` proves a
+            // recognized phrase reached a byte sink that goes to the Mac.
+            diagnosticLog?.record(DiagnosticEvent(
+                .inputCommitRouted,
+                a: text.utf8.count,
+                b: InputCommitSink.pasteText.rawValue
+            ))
+            MobileDebugLog.anchormux("input.commitRouted len=\(text.utf8.count) sink=pasteText")
+            #endif
+            onPasteText?(text)
+        case .paste, .input:
+            #if DEBUG
+            diagnosticLog?.record(DiagnosticEvent(
+                .inputCommitRouted,
+                a: text.utf8.count,
+                b: InputCommitSink.text.rawValue
+            ))
+            MobileDebugLog.anchormux("input.commitRouted len=\(text.utf8.count) sink=text")
+            #endif
+            // No paste sink wired (or a single character): per-character input.
+            onText?(text)
         }
     }
 
@@ -1162,12 +1515,13 @@ final class TerminalInputTextView: UITextView {
         if !armed { consumeModifier(.shift) }
     }
 
+
     #if DEBUG
     /// Maps a `UIResponder` to its compact ``InputResponderIdentity`` for the
-    /// composer-dock diagnostics. Used to encode *which* view owns first
-    /// responder into the integer ``DiagnosticEvent`` payload. The `.other` case
-    /// is paired with the responder's class name in the companion `anchormux`
-    /// string log for a human-readable readback.
+    /// hold-backspace + dictation diagnostic round. Used to encode *which* view
+    /// owns first responder into the integer ``DiagnosticEvent`` payload. The
+    /// `.other` case is paired with the responder's class name in the companion
+    /// `anchormux` string log for a human-readable readback.
     static func responderIdentity(of responder: UIResponder?) -> InputResponderIdentity {
         switch responder {
         case nil: return .none
@@ -1190,16 +1544,205 @@ final class TerminalInputTextView: UITextView {
     #endif
 }
 
-extension TerminalInputTextView: UITextViewDelegate {
-    func textView(_ textView: UITextView, shouldChangeTextIn range: NSRange, replacementText text: String) -> Bool {
-        TerminalInputDebugLog.log("proxy.shouldChange replacement=\(TerminalInputDebugLog.textSummary(text)) marked=\(textView.markedTextRange != nil) range=\(range.location):\(range.length)")
-        return true
+// MARK: - UITextInputTraits
+
+extension TerminalInputTextView {
+    // Autocorrect/predictive/smart substitutions are all off: the view forwards
+    // each keystroke to the remote terminal and keeps no in-progress word for the
+    // keyboard to correct against. Returning these as computed properties (rather
+    // than the `UITextView` stored traits the old design used) keeps the keyboard
+    // from offering corrections it could never apply.
+    var autocorrectionType: UITextAutocorrectionType { get { .no } set {} }
+    var autocapitalizationType: UITextAutocapitalizationType { get { .none } set {} }
+    var spellCheckingType: UITextSpellCheckingType { get { .no } set {} }
+    var smartQuotesType: UITextSmartQuotesType { get { .no } set {} }
+    var smartDashesType: UITextSmartDashesType { get { .no } set {} }
+    var smartInsertDeleteType: UITextSmartInsertDeleteType { get { .no } set {} }
+    var keyboardType: UIKeyboardType { get { .default } set {} }
+    var returnKeyType: UIReturnKeyType { get { .default } set {} }
+}
+
+// MARK: - UITextInput (documentless conformance + delete-repeat anchor)
+
+// This view owns no editable document. It implements `UITextInput` to unlock two
+// keyboard features a bare `UIKeyInput` view does not get — system dictation (the
+// mic key) and IME marked-text composition — and to present vvterm's toggling
+// one-character zero-width *delete-repeat anchor* so the software keyboard's
+// modern document-driven backspace auto-repeat keeps firing while the key is
+// held. Recognized dictation text and committed IME candidates both arrive
+// through ``insertText(_:)`` and route to the terminal. UIKit walks the virtual
+// document (`textInputDocument`) through the offset-bearing
+// ``TerminalInputTextPosition`` / ``TerminalInputTextRange`` types, so positions
+// and ranges carry real UTF-16 offsets rather than acting as pure identity
+// sentinels — that is what lets the view report a one-character document with the
+// caret at the end, the condition the repeat path checks.
+extension TerminalInputTextView {
+    var markedTextRange: UITextRange? {
+        guard let markedText, !markedText.isEmpty else { return nil }
+        return TerminalInputTextRange(start: 0, end: (markedText as NSString).length)
     }
 
-    func textViewDidChange(_ textView: UITextView) {
-        handleTextChange(
-            currentText: textView.text ?? "",
-            isComposing: textView.markedTextRange != nil
-        )
+    var selectedTextRange: UITextRange? {
+        get {
+            let range = effectiveSelectedRange
+            return TerminalInputTextRange(start: range.location, end: range.location + range.length)
+        }
+        set {}
+    }
+
+    var markedTextStyle: [NSAttributedString.Key: Any]? {
+        get { nil }
+        set {}
+    }
+
+    var beginningOfDocument: UITextPosition { TerminalInputTextPosition(offset: 0) }
+    var endOfDocument: UITextPosition { TerminalInputTextPosition(offset: textInputDocumentLength) }
+
+    /// The IME hands a candidate string in; hold it as the marked composition so
+    /// ``markedTextRange`` reports active composition (which also suppresses the
+    /// delete-repeat anchor). Nothing is sent to the terminal until the candidate
+    /// commits via ``insertText(_:)`` or ``unmarkText()``.
+    ///
+    /// Mutating ``markedText`` changes the string the view exposes through
+    /// ``text(in:)``/``markedTextRange``, so it is a *text* change in the
+    /// ``UITextInputDelegate`` contract: it is bracketed with
+    /// `textWillChange`/`textDidChange` (via ``withMarkedTextChange(_:)``) so the
+    /// IME and dictation machinery keep their composition state synchronized.
+    func setMarkedText(_ markedText: String?, selectedRange: NSRange) {
+        TerminalInputDebugLog.log("proxy.setMarkedText text=\(TerminalInputDebugLog.textSummary(markedText ?? ""))")
+        withMarkedTextChange {
+            self.markedText = (markedText?.isEmpty == true) ? nil : markedText
+        }
+    }
+
+    /// Brackets a mutation of ``markedText`` (or the anchor crossover when
+    /// composition ends) with the `UITextInputDelegate` text-change callbacks.
+    ///
+    /// The marked composition is the only committed text this view exposes, so
+    /// any change to it — set by the IME, committed by
+    /// ``insertText(_:)``/``unmarkText()``, or canceled by ``deleteBackward()`` —
+    /// is a text change UIKit must be told about with
+    /// `textWillChange`/`textDidChange`. Selection-only callbacks would leave the
+    /// keyboard observing stale composition state.
+    private func withMarkedTextChange(_ mutate: () -> Void) {
+        inputDelegate?.textWillChange(self)
+        mutate()
+        inputDelegate?.textDidChange(self)
+    }
+
+    /// Commit the in-progress IME composition. Forwards the held candidate to the
+    /// terminal as one block.
+    func unmarkText() {
+        guard let composing = markedText else { return }
+        withMarkedTextChange { markedText = nil }
+        emitCommittedText(composing, source: "unmarkText")
+    }
+
+    func text(in range: UITextRange) -> String? {
+        guard let range = range as? TerminalInputTextRange else { return nil }
+        let document = textInputDocument as NSString
+        let clamped = clampedDocumentRange(range.nsRange, length: document.length)
+        guard clamped.length > 0 else { return "" }
+        return document.substring(with: clamped)
+    }
+
+    /// Commit text delivered through a range replacement.
+    ///
+    /// Most committed input arrives via ``insertText(_:)``, but some system paths
+    /// (text replacement, certain dictation/suggestion commits) deliver it by
+    /// replacing ``selectedTextRange`` or ``markedTextRange`` instead. The view
+    /// holds no addressable document, so the range itself is ignored, but the
+    /// *text* must still reach the terminal — route it through the same commit
+    /// path as ``insertText(_:)``. A replacement of the marked region supersedes
+    /// the in-progress IME composition, so clear it first. An empty replacement is
+    /// a pure deletion of the marked composition (no committed text to send).
+    func replace(_ range: UITextRange, withText text: String) {
+        TerminalInputDebugLog.log("proxy.replace text=\(TerminalInputDebugLog.textSummary(text))")
+        if markedText != nil {
+            withMarkedTextChange { markedText = nil }
+        }
+        guard !text.isEmpty else { return }
+        emitCommittedText(text, source: "replace")
+    }
+
+    func textRange(from fromPosition: UITextPosition, to toPosition: UITextPosition) -> UITextRange? {
+        guard let from = fromPosition as? TerminalInputTextPosition,
+              let to = toPosition as? TerminalInputTextPosition else { return nil }
+        return TerminalInputTextRange(start: from.offset, end: to.offset)
+    }
+
+    func position(from position: UITextPosition, offset: Int) -> UITextPosition? {
+        guard let position = position as? TerminalInputTextPosition else { return nil }
+        let target = min(max(position.offset + offset, 0), textInputDocumentLength)
+        return TerminalInputTextPosition(offset: target)
+    }
+
+    func position(from position: UITextPosition, in direction: UITextLayoutDirection, offset: Int) -> UITextPosition? {
+        guard let position = position as? TerminalInputTextPosition else { return nil }
+        let delta = (direction == .right || direction == .down) ? offset : -offset
+        let target = min(max(position.offset + delta, 0), textInputDocumentLength)
+        return TerminalInputTextPosition(offset: target)
+    }
+
+    func compare(_ position: UITextPosition, to other: UITextPosition) -> ComparisonResult {
+        guard let lhs = position as? TerminalInputTextPosition,
+              let rhs = other as? TerminalInputTextPosition else { return .orderedSame }
+        if lhs.offset < rhs.offset { return .orderedAscending }
+        if lhs.offset > rhs.offset { return .orderedDescending }
+        return .orderedSame
+    }
+
+    func offset(from: UITextPosition, to toPosition: UITextPosition) -> Int {
+        guard let from = from as? TerminalInputTextPosition,
+              let to = toPosition as? TerminalInputTextPosition else { return 0 }
+        return to.offset - from.offset
+    }
+
+    func position(within range: UITextRange, farthestIn direction: UITextLayoutDirection) -> UITextPosition? { nil }
+    func characterRange(byExtending position: UITextPosition, in direction: UITextLayoutDirection) -> UITextRange? { nil }
+    func baseWritingDirection(for position: UITextPosition, in direction: UITextStorageDirection) -> NSWritingDirection { .leftToRight }
+    func setBaseWritingDirection(_ writingDirection: NSWritingDirection, for range: UITextRange) {}
+    func firstRect(for range: UITextRange) -> CGRect { .zero }
+    func caretRect(for position: UITextPosition) -> CGRect { .zero }
+    func selectionRects(for range: UITextRange) -> [UITextSelectionRect] { [] }
+    func closestPosition(to point: CGPoint) -> UITextPosition? { nil }
+    func closestPosition(to point: CGPoint, within range: UITextRange) -> UITextPosition? { nil }
+    func characterRange(at point: CGPoint) -> UITextRange? { nil }
+
+    private func clampedDocumentRange(_ range: NSRange, length: Int) -> NSRange {
+        let location = min(max(range.location, 0), length)
+        let rangeLength = min(max(range.length, 0), max(length - location, 0))
+        return NSRange(location: location, length: rangeLength)
+    }
+
+    // MARK: Dictation placeholder hooks
+    //
+    // UIKit calls these when the mic is tapped. Returning a placeholder (an empty
+    // token; iSH does the same) is what tells the framework this view accepts
+    // dictation; the recognized text then arrives via `insertText`. The remove
+    // hook is a no-op because there is no document placeholder to strip.
+    func insertDictationResultPlaceholder() -> Any {
+        #if DEBUG
+        // The ENTRY signal that the mic was tapped and UIKit accepted this view
+        // as a dictation target. Its absence after a mic tap proves dictation
+        // never engaged this view at all (the framework dictated into something
+        // else, or nowhere).
+        diagnosticLog?.record(DiagnosticEvent(.inputDictationPlaceholder))
+        MobileDebugLog.anchormux("input.dictation.placeholder requested")
+        #endif
+        return ""
+    }
+
+    func removeDictationResultPlaceholder(_ placeholder: Any, willInsertResult: Bool) {
+        #if DEBUG
+        // `a == 0` after a mic tap means recognition produced nothing for this
+        // view; `a == 1` means a recognized result is about to arrive via
+        // ``insertText(_:)``.
+        diagnosticLog?.record(DiagnosticEvent(
+            .inputDictationRemove,
+            a: willInsertResult ? 1 : 0
+        ))
+        MobileDebugLog.anchormux("input.dictation.remove willInsertResult=\(willInsertResult)")
+        #endif
     }
 }

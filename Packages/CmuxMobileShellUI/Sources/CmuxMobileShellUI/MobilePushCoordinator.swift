@@ -28,7 +28,42 @@ public final class MobilePushCoordinator {
     private nonisolated(unsafe) let defaults: UserDefaults
     private static let enabledKey = "cmux.notifications.pushEnabled"
 
+    /// APNs `aps.category` the web sets on every cmux terminal push (see
+    /// `CMUX_APNS_CATEGORY` in `web/services/apns/payload.ts`). The matching
+    /// ``UNNotificationCategory`` registered below carries
+    /// `.customDismissAction`, so a swipe/clear delivers
+    /// `UNNotificationDismissActionIdentifier` to the app and we can forward the
+    /// dismiss to the Mac. Keep these two ids in sync.
+    public static let dismissSyncCategoryIdentifier = "cmux.terminal"
+
     @ObservationIgnored private weak var store: CMUXMobileShellStore?
+
+    /// The set of workspace ids muted for phone push, as an observation-tracked
+    /// stored property so SwiftUI re-renders the workspace list when a row is
+    /// muted/unmuted. Hydrated from the registration service at launch (the
+    /// service owns the persisted source of truth) and kept in lock-step on
+    /// every toggle. Unlike ``isEnabled`` (a deliberately non-observable
+    /// `UserDefaults` mirror), this must be observable: the list's per-row mute
+    /// indicator and context-menu label derive from it directly.
+    public private(set) var mutedWorkspaceIDs: Set<String> = []
+
+    /// The single in-flight server mute hydration, owned so it can be cancelled.
+    /// Starting a new refresh or signing out cancels the prior one, so a stale
+    /// fetch (e.g. one begun under a previous account whose tokens are briefly
+    /// still valid during sign-out) can never write its result back. Using
+    /// structured ownership + cancellation instead of a generation counter keeps
+    /// exactly one authoritative refresh and avoids a stale task performing any
+    /// destructive cleanup. `@ObservationIgnored`: it is lifecycle, not rendered.
+    @ObservationIgnored private var mutedRefreshTask: Task<Void, Never>?
+    /// In-flight per-workspace mute toggle syncs, owned so sign-out can cancel
+    /// any tap that has not yet reached the registration actor. Without this, a
+    /// toggle task created just before an account switch could run under the next
+    /// account and persist the previous screen's workspace id as that account's
+    /// mute. Cancelling them on sign-out (plus the service's per-user key) keeps
+    /// a tap from leaking across accounts. Keyed by a stable `UUID` so the task
+    /// body removes its own entry by id without capturing the task handle (which
+    /// Swift 6 strict concurrency rejects as a captured-mutable-var reference).
+    @ObservationIgnored private var muteToggleTasks: [UUID: Task<Void, Never>] = [:]
 
     /// Creates a push coordinator.
     /// - Parameters:
@@ -55,13 +90,93 @@ public final class MobilePushCoordinator {
         self.store = store
     }
 
-    /// Install the notification-center delegate and, if already opted in,
-    /// re-assert remote registration so a rotated token re-uploads. Call once at
-    /// launch from the AppDelegate.
+    /// Install the notification-center delegate, register the dismiss-sync
+    /// notification category, and, if already opted in, re-assert remote
+    /// registration so a rotated token re-uploads. Call once at launch from the
+    /// AppDelegate.
+    ///
+    /// This never requests notification authorization: the OS prompt only ever
+    /// fires from ``enable()`` (the explicit user opt-in), so a fresh launch on a
+    /// phone that has not opted in shows no permission dialog.
     public func configure(delegate: any UNUserNotificationCenterDelegate) {
-        UNUserNotificationCenter.current().delegate = delegate
+        let center = UNUserNotificationCenter.current()
+        center.delegate = delegate
+        // The category must carry `.customDismissAction` so a swipe/clear of a
+        // cmux banner delivers `UNNotificationDismissActionIdentifier` to the
+        // delegate; that is what lets us tell the Mac the user dismissed it.
+        let dismissSyncCategory = UNNotificationCategory(
+            identifier: Self.dismissSyncCategoryIdentifier,
+            actions: [],
+            intentIdentifiers: [],
+            options: [.customDismissAction]
+        )
+        center.setNotificationCategories([dismissSyncCategory])
         if isEnabled {
             UIApplication.shared.registerForRemoteNotifications()
+        }
+        // Hydrate the observable muted set from the persisted source of truth so
+        // the workspace list reflects prior mutes immediately on launch.
+        Task { mutedWorkspaceIDs = await registration.mutedWorkspaceIDs }
+    }
+
+    /// Whether `workspaceId` is currently muted for phone push.
+    public func isWorkspaceMuted(_ workspaceId: String) -> Bool {
+        mutedWorkspaceIDs.contains(workspaceId)
+    }
+
+    /// Pull the authoritative muted set from the server and republish the
+    /// observable from it. Call on sign-in: the server set is keyed by the
+    /// authenticated user, so this overwrites any locally cached set from a
+    /// previous account instead of re-uploading it. A network failure / signed
+    /// out state keeps the existing local set (no clobber to empty).
+    ///
+    /// Owns a single cancellable refresh task: a new refresh or a sign-out
+    /// cancels any prior one, and a cancelled fetch never writes its (stale)
+    /// result back, so a refresh begun under a previous account can't repopulate
+    /// the cache after sign-out.
+    public func refreshMutedWorkspacesFromServer() {
+        // Persistence is namespaced per user in the service, so a stale fetch can
+        // never leak across accounts. This task guards only the shared OBSERVABLE
+        // (the live UI value): a new refresh or a sign-out cancels the prior one
+        // so a fetch begun under a previous account can't publish its set into the
+        // current session's list.
+        mutedRefreshTask?.cancel()
+        mutedRefreshTask = Task { [weak self] in
+            guard let self else { return }
+            let serverSet = await self.registration.hydrateMutedWorkspacesFromServer()
+            guard !Task.isCancelled else { return }
+            self.mutedWorkspaceIDs = serverSet
+        }
+    }
+
+    /// Set phone-push mute for a workspace to an explicit state. Updates the
+    /// observable set optimistically (so the list re-renders at once), persists,
+    /// and syncs the full muted set to the server, where delivery is actually
+    /// gated. Honors the requested `muted` value rather than toggling, so a stale
+    /// row snapshot or a state change while a context menu is open can never flip
+    /// the workspace to the wrong state.
+    public func setWorkspaceMuted(_ workspaceId: String, muted: Bool) {
+        if muted == mutedWorkspaceIDs.contains(workspaceId) { return }
+        if muted {
+            mutedWorkspaceIDs.insert(workspaceId)
+        } else {
+            mutedWorkspaceIDs.remove(workspaceId)
+        }
+        analytics.capture("ios_push_workspace_mute_toggled", ["muted": .bool(muted)])
+        // Own the toggle so sign-out can cancel a tap that has not yet reached the
+        // registration actor, so it can't run under (and write for) the next
+        // account. Keyed by a stable id captured by value (no task self-capture).
+        let id = UUID()
+        muteToggleTasks[id] = Task { [weak self] in
+            guard let self else { return }
+            defer { self.muteToggleTasks[id] = nil }
+            // If sign-out cancelled this before it ran, do not write.
+            guard !Task.isCancelled else { return }
+            await self.registration.setWorkspaceMuted(workspaceId, muted: muted)
+            guard !Task.isCancelled else { return }
+            // Reconcile against the persisted authoritative set in case a
+            // concurrent change interleaved.
+            self.mutedWorkspaceIDs = await self.registration.mutedWorkspaceIDs
         }
     }
 
@@ -116,9 +231,35 @@ public final class MobilePushCoordinator {
         await registration.unregisterFromServer()
     }
 
+    /// Sign-out cleanup: reset the observable to empty and remove the device
+    /// token server-side. The persisted muted set does NOT need clearing: it is
+    /// namespaced by user id in the service, so the signed-out account's mutes
+    /// stay under their own key (restored on their next sign-in) and the next
+    /// account reads its own empty/namespaced key. Cancelling the refresh task
+    /// stops a stale fetch from re-publishing the prior account's set into the
+    /// now-empty observable.
+    public func handleSignedOut() async {
+        mutedRefreshTask?.cancel()
+        mutedRefreshTask = nil
+        // Cancel any pending toggle taps so they can't run under the next account.
+        for task in muteToggleTasks.values { task.cancel() }
+        muteToggleTasks.removeAll()
+        mutedWorkspaceIDs = []
+        await registration.unregisterFromServer()
+    }
+
     /// Whether to show a banner while the app is foreground. Suppressed when the
-    /// user is already viewing the terminal the notification is about.
+    /// workspace is muted, or when the user is already viewing the terminal the
+    /// notification is about.
     public func shouldPresentInForeground(workspaceId: String?, surfaceId: String?) -> Bool {
+        // Honor the per-workspace mute locally too: the server is the primary
+        // gate, but a push can already be in flight when the mute PUT lands, or
+        // the server can fail open on a mute-lookup error, so a muted workspace
+        // must never surface a foreground banner/sound. Mirrors the server's
+        // `shouldDeliverToWorkspace`.
+        guard pushShouldDeliver(workspaceId: workspaceId, muted: mutedWorkspaceIDs) else {
+            return false
+        }
         guard let store, let workspaceId,
               store.selectedWorkspaceID?.rawValue == workspaceId else {
             return true
@@ -136,7 +277,13 @@ public final class MobilePushCoordinator {
             return
         }
         if let workspaceId {
-            store.selectedWorkspaceID = MobileWorkspacePreview.ID(rawValue: workspaceId)
+            // Route through the shared explicit-open intent so every deep-link
+            // entrypoint (APNs tap, in-app feed tap) behaves identically: it
+            // pushes the compact iPhone navigation stack AND drives the tab
+            // container back to the Workspaces tab, instead of only mutating the
+            // selection behind the scenes (which left a push tap stranded on the
+            // Notifications tab once the tab bar was added).
+            store.requestOpenWorkspace(MobileWorkspacePreview.ID(rawValue: workspaceId))
         }
         if let surfaceId {
             store.selectTerminal(MobileTerminalPreview.ID(rawValue: surfaceId))
@@ -145,6 +292,19 @@ public final class MobilePushCoordinator {
             "resolved_workspace": .bool(workspaceId != nil),
             "resolved_surface": .bool(surfaceId != nil),
         ])
+    }
+
+    /// Forward a phone-side notification dismissal to the paired Mac so it marks
+    /// the notification read and clears its own banner. Fire-and-forget over the
+    /// attach channel; carries only the opaque notification id, never content.
+    /// - Parameter notificationId: The stable id of the dismissed notification.
+    ///   For a remote push this is `request.identifier` (the `apns-collapse-id`),
+    ///   with `cmux.notificationId` as a fallback.
+    public func handleDismiss(notificationId: String?) async {
+        guard let store,
+              let notificationId,
+              !notificationId.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        await store.dismissNotification(ids: [notificationId])
     }
 }
 #endif
