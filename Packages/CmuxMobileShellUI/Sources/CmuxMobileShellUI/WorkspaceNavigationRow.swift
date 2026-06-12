@@ -8,6 +8,9 @@ struct WorkspaceNavigationRow: View {
     let isSelected: Bool
     let navigationStyle: WorkspaceNavigationStyle
     let wrapWorkspaceTitles: Bool
+    /// How many lines the activity preview shows (1 or 2), forwarded to the
+    /// shared ``WorkspaceRow``.
+    var previewLineLimit: Int = MobileDisplaySettings.defaultWorkspacePreviewLineCount
     /// Unread-notification count for this workspace (plain value snapshot).
     var unreadCount: Int = 0
     let selectWorkspace: (MobileWorkspacePreview.ID) -> Void
@@ -36,6 +39,7 @@ struct WorkspaceNavigationRow: View {
                         connectionStatus: connectionStatus,
                         isSelected: false,
                         wrapWorkspaceTitles: wrapWorkspaceTitles,
+                        previewLineLimit: previewLineLimit,
                         isMuted: isMuted,
                         unreadCount: unreadCount
                     )
@@ -52,6 +56,7 @@ struct WorkspaceNavigationRow: View {
                         connectionStatus: connectionStatus,
                         isSelected: isSelected,
                         wrapWorkspaceTitles: wrapWorkspaceTitles,
+                        previewLineLimit: previewLineLimit,
                         isMuted: isMuted,
                         unreadCount: unreadCount
                     )

@@ -22,6 +22,9 @@ struct WorkspaceListView: View {
     /// single line. Passed in as a value snapshot so no `@Observable` store
     /// crosses the `List` boundary.
     let wrapWorkspaceTitles: Bool
+    /// How many lines each row's activity preview shows (1 or 2). Passed in as
+    /// a value snapshot so no `@Observable` store crosses the `List` boundary.
+    var previewLineLimit: Int = MobileDisplaySettings.defaultWorkspacePreviewLineCount
     /// Per-workspace unread-notification counts, keyed by workspace id raw value.
     /// Computed by the parent (outside this `List`) and passed as a plain value
     /// snapshot so the notifications store never crosses the `List` boundary.
@@ -65,6 +68,9 @@ struct WorkspaceListView: View {
     @State private var showingShortcutsSettings = false
     @State private var showingSettings = false
     @State private var showingDeviceTree = false
+    /// The active row filter (All / Unread), shared-model state behind the
+    /// toolbar ``WorkspaceListFilterMenu``. Session-transient like a search.
+    @State private var filter: MobileWorkspaceListFilter = .all
 
     private var trimmedQuery: String {
         searchText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -78,9 +84,10 @@ struct WorkspaceListView: View {
     /// not flatten sections the list already has (it would only lose the chevron
     /// action). A search flattens to a single matched, pinned-first list so
     /// members can be found across groups; floating pinned members out of their
-    /// group is acceptable while filtering.
+    /// group is acceptable while filtering. An active row filter (Unread)
+    /// flattens the same way, for the same reason.
     private var rendersGroupedSections: Bool {
-        !groups.isEmpty && trimmedQuery.isEmpty
+        !groups.isEmpty && trimmedQuery.isEmpty && !filter.isActive
     }
 
     private func matchesQuery(_ workspace: MobileWorkspacePreview, query: String) -> Bool {
@@ -89,16 +96,15 @@ struct WorkspaceListView: View {
             || workspace.terminals.contains { $0.name.localizedCaseInsensitiveContains(query) }
     }
 
-    /// Workspaces after search filtering, pinned ones first (stable within each
-    /// group so the Mac's order is otherwise preserved). Used for the flat
-    /// (ungrouped or searching) presentation.
+    /// Workspaces after the row filter (Unread) and search filtering, pinned
+    /// ones first (stable within each group so the Mac's order is otherwise
+    /// preserved). Used for the flat (ungrouped, filtering, or searching)
+    /// presentation.
     private var filteredWorkspaces: [MobileWorkspacePreview] {
         let query = trimmedQuery
-        let matches: [MobileWorkspacePreview]
-        if query.isEmpty {
-            matches = workspaces
-        } else {
-            matches = workspaces.filter { matchesQuery($0, query: query) }
+        let matches = workspaces.filter { workspace in
+            filter.matches(workspace)
+                && (query.isEmpty || matchesQuery(workspace, query: query))
         }
         return matches.enumerated()
             .sorted { lhs, rhs in
@@ -129,6 +135,13 @@ struct WorkspaceListView: View {
             Section {
                 if rendersGroupedSections {
                     groupedRows
+                } else if filter.isActive && trimmedQuery.isEmpty && filteredWorkspaces.isEmpty && !workspaces.isEmpty {
+                    // The filter alone (not the Mac, and not a search query)
+                    // emptied the list; offer the way back. While searching, the
+                    // standard empty search result is shown instead, since "Show
+                    // All" would not resolve a query that matches nothing.
+                    WorkspaceListFilterEmptyRow(filter: filter) { filter = .all }
+                        .listRowSeparator(.hidden)
                 } else {
                     flatRows
                 }
@@ -149,11 +162,13 @@ struct WorkspaceListView: View {
                     devicesButton
                 }
             }
-            ToolbarItem(placement: .topBarTrailing) {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                WorkspaceListFilterMenu(filter: $filter)
                 newWorkspaceButton
             }
             #else
-            ToolbarItem {
+            ToolbarItemGroup {
+                WorkspaceListFilterMenu(filter: $filter)
                 newWorkspaceButton
             }
             #endif
@@ -210,9 +225,10 @@ struct WorkspaceListView: View {
     private var groupedRows: some View {
         ForEach(groupedListItems) { item in
             switch item {
-            case .groupHeader(let group):
+            case .groupHeader(let group, let hasUnread):
                 WorkspaceGroupHeaderRow(
                     group: group,
+                    hasUnread: hasUnread,
                     navigationStyle: navigationStyle,
                     isAnchorSelected: navigationStyle == .sidebar
                         && selectedWorkspaceID == group.anchorWorkspaceID,
@@ -235,6 +251,7 @@ struct WorkspaceListView: View {
             isSelected: navigationStyle == .sidebar && selectedWorkspaceID == workspace.id,
             navigationStyle: navigationStyle,
             wrapWorkspaceTitles: wrapWorkspaceTitles,
+            previewLineLimit: previewLineLimit,
             unreadCount: unreadCountsByWorkspace[workspace.id.rawValue] ?? 0,
             selectWorkspace: selectWorkspace,
             renameWorkspace: renameWorkspace,

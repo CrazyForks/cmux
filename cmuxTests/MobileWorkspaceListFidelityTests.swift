@@ -201,6 +201,79 @@ struct MobileWorkspaceListFidelityTests {
         #expect(after != changed, "a newer notification must change the mobile summary hash")
     }
 
+    /// Why some rows showed no relative time: the payload's only timestamp was
+    /// `preview_at`, sourced from the latest notification, so a workspace that
+    /// never fired a notification carried no timestamp at all and its trailing
+    /// slot stayed empty on the phone. Every workspace payload must carry
+    /// `last_activity_at` (the latest notification when there is one, the
+    /// workspace's creation time otherwise) so every row can render a time.
+    @Test func everyWorkspacePayloadCarriesLastActivity() throws {
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+
+        // A freshly created workspace has no notification, so it has no preview
+        // and previously no timestamp of any kind.
+        let payload = TerminalController.shared.mobileWorkspacePayload(
+            workspace: workspace,
+            isSelected: false,
+            requestedTerminalID: nil
+        )
+        #expect(payload["preview_at"] is NSNull, "no notification means no preview timestamp")
+
+        let lastActivity = try #require(
+            payload["last_activity_at"] as? Double,
+            "a quiet workspace must still carry a last-activity stamp"
+        )
+        // The fallback is the workspace's creation time: a real, recent instant,
+        // never the epoch (which the phone treats as "no activity").
+        let now = Date().timeIntervalSince1970
+        #expect(lastActivity > now - 3600)
+        #expect(lastActivity <= now + 60)
+    }
+
+    /// The payload's `has_unread` mirrors the Mac sidebar's workspace unread
+    /// badge, and flipping it must also change the observer's per-workspace
+    /// signature so the phone is told to refresh (an unread toggle changes
+    /// nothing else this observer watches).
+    @Test func workspaceUnreadFlagFlowsIntoPayloadAndSignature() throws {
+        let manager = TabManager()
+        let workspace = try #require(manager.selectedWorkspace)
+        let store = TerminalNotificationStore.shared
+        #expect(!store.workspaceIsUnread(forTabId: workspace.id))
+
+        let readPayload = TerminalController.shared.mobileWorkspacePayload(
+            workspace: workspace,
+            isSelected: false,
+            requestedTerminalID: nil,
+            notificationStore: store
+        )
+        #expect(readPayload["has_unread"] as? Bool == false)
+        let readSignatures = MobileWorkspaceListObserver.previewSignatures(
+            for: [workspace],
+            notificationStore: store
+        )
+
+        #expect(store.setPanelDerivedUnread(true, forTabId: workspace.id))
+        defer { store.setPanelDerivedUnread(false, forTabId: workspace.id) }
+
+        let unreadPayload = TerminalController.shared.mobileWorkspacePayload(
+            workspace: workspace,
+            isSelected: false,
+            requestedTerminalID: nil,
+            notificationStore: store
+        )
+        #expect(unreadPayload["has_unread"] as? Bool == true)
+
+        let unreadSignatures = MobileWorkspaceListObserver.previewSignatures(
+            for: [workspace],
+            notificationStore: store
+        )
+        #expect(
+            readSignatures[workspace.id] != unreadSignatures[workspace.id],
+            "an unread flip must change the per-workspace signature so the observer re-emits"
+        )
+    }
+
     /// The mobile preview line must flatten arbitrary notification text into one
     /// short plain-text line: ANSI escapes stripped, control characters and
     /// newlines collapsed, whitespace runs joined, length capped with an ellipsis,
@@ -233,6 +306,16 @@ struct MobileWorkspaceListFidelityTests {
         // An OSC sequence left unterminated (e.g. cut by the input cap) is
         // stripped wholly rather than leaking its payload bytes.
         #expect(TerminalController.mobilePreviewSanitize("\u{001B}]0;unterminated title") == nil)
+        // CSI parameter bytes are the full ECMA-48 0x30-0x3F range, not just
+        // digits/;/?. Modern 24-bit color uses colon-separated SGR parameters
+        // (ESC[38:2::255:0:0m); stripping must consume the whole sequence
+        // instead of leaving ":2::255:0:0m" visible in the preview.
+        #expect(
+            TerminalController.mobilePreviewSanitize("\u{001B}[38:2::255:0:0mred\u{001B}[0m text") ==
+                "red text"
+        )
+        // Same range covers the private-use <=> parameter bytes.
+        #expect(TerminalController.mobilePreviewSanitize("\u{001B}[>4;2mok") == "ok")
         // The input bound must hold in unicode scalars, not Characters: a single
         // crafted grapheme cluster carrying a huge run of combining marks is one
         // Character, so a Character-counted cap never truncates it and the whole

@@ -9,6 +9,10 @@ struct WorkspaceRow: View {
     /// When `true`, the workspace title wraps onto multiple lines instead of
     /// truncating to one (driven by the "Wrap Workspace Titles" setting).
     let wrapWorkspaceTitles: Bool
+    /// How many lines the activity preview shows (1 or 2, driven by the
+    /// "Preview Lines" setting; 2 is the default). Space is reserved so rows
+    /// with short previews keep the same height as their neighbors.
+    var previewLineLimit: Int = MobileDisplaySettings.defaultWorkspacePreviewLineCount
     /// When `true`, the user has muted phone push for this workspace; the row
     /// shows a `bell.slash` glyph so the muted state is visible at a glance.
     /// Passed as a value snapshot so no `@Observable` store crosses the `List`
@@ -21,6 +25,12 @@ struct WorkspaceRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
+            // Unread is JUST this dot, left of the icon like iMessage. The
+            // gutter is always present (hidden dot when read) so read and
+            // unread rows line up. Centered against the avatar's height.
+            WorkspaceUnreadDot(isUnread: workspace.hasUnread)
+                .frame(height: 48)
+
             ZStack(alignment: .topTrailing) {
                 WorkspaceAvatar(workspace: workspace)
                 if unreadCount > 0 {
@@ -68,7 +78,7 @@ struct WorkspaceRow: View {
                 Text(workspace.previewLine)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
+                    .lineLimit(previewLineLimit, reservesSpace: true)
 
                 HStack(spacing: 6) {
                     Circle()
