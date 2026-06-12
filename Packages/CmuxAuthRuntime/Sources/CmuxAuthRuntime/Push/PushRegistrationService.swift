@@ -236,6 +236,8 @@ public actor PushRegistrationService: PushRegistering {
             }
         }
         return bounded
+    }
+
     /// Delete the device token from the server at sign-out, authenticating
     /// with the credentials captured before the local-first clear destroyed
     /// the live session.
@@ -436,22 +438,6 @@ public actor PushRegistrationService: PushRegistering {
         capturedAccessToken: String? = nil,
         capturedRefreshToken: String? = nil
     ) async -> URLRequest? {
-        let accessToken: String
-        let refreshToken: String
-        if let capturedAccessToken, let capturedRefreshToken {
-            // Sign-out path: the live provider is already cleared by the
-            // local-first sign-out; the captured pair is the only credential.
-            accessToken = capturedAccessToken
-            refreshToken = capturedRefreshToken
-        } else {
-            do {
-                accessToken = try await tokenProvider.accessToken()
-            } catch {
-                return nil
-            }
-            guard let liveRefreshToken = await tokenProvider.refreshToken() else { return nil }
-            refreshToken = liveRefreshToken
-        }
         let accessToken: String
         let refreshToken: String
         if let capturedAccessToken, let capturedRefreshToken {

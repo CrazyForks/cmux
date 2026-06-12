@@ -112,6 +112,9 @@ final class PhonePushClient {
         // by the active-decision cache instead of the send throttle, because
         // suppression must not consume a send slot. See
         // `MacPresenceDecisionCache` for the explicit staleness invariant.
+        // A suppressed forward queues no banner push, so it reports `false`
+        // like a throttled one: the store must not dismiss the superseded
+        // banner when no replacement is coming.
         let mode = PhoneForwardingMode.fromDefaults()
         if mode != .always {
             let presence = presenceCache.decision(from: presenceMonitor)

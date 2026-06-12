@@ -36,3 +36,22 @@ public protocol DeliveredNotificationClearing: Sendable {
     /// - Parameter count: The unread total; clamped to zero by conformers.
     func setBadgeCount(_ count: Int)
 }
+
+/// Inert ``DeliveredNotificationClearing`` for previews and tests that do not
+/// assert on the system-notification surface. ``MobileShellComposite/preview(runtime:)``
+/// injects it so preview/test stores never touch `UNUserNotificationCenter`,
+/// which raises an Objective-C exception in processes without an app bundle
+/// (e.g. the SwiftPM test host).
+public struct NoopDeliveredNotificationClearer: DeliveredNotificationClearing {
+    /// Creates an inert clearer.
+    public init() {}
+
+    /// No-op.
+    public func removeDelivered(ids: [String]) async {}
+
+    /// Always empty: a preview/test store reconciles against no banners.
+    public func deliveredIdentifiers() async -> [String] { [] }
+
+    /// No-op.
+    public func setBadgeCount(_ count: Int) {}
+}

@@ -241,7 +241,8 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// `mobile.host.status` resolve as the other capability flags so the DEV
     /// checklist subscription never needs its own status round-trip (the
     /// render-grid liveness watchdog's regression tests count those).
-    private var supportsDogfoodChecklist = false
+    // Internal (not private): used by the dogfood-feedback extension file.
+    var supportsDogfoodChecklist = false
     #endif
     /// Whether the connected Mac advertises the `dogfood.v1` capability (the
     /// `dogfood.feedback.submit` agent sink). `false` until host status is read,
@@ -477,7 +478,8 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// intentionally left out of the set and allowed to autofocus.
     private var terminalAutoFocusSuppressedSurfaceIDs: Set<String> = []
 
-    private let runtime: (any MobileSyncRuntime)?
+    // Internal (not private): used by the dogfood-feedback extension file.
+    let runtime: (any MobileSyncRuntime)?
     private let pairedMacStore: (any MobilePairedMacStoring)?
     /// Best-effort, team-scoped lookup of fresher attach routes from the device
     /// registry. Optional and failure-tolerant: when `nil` or unreachable,
@@ -486,13 +488,16 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     private let deviceRegistry: (any DeviceRegistryRefreshing)?
     private let identityProvider: (any MobileIdentityProviding)?
     private let reachability: any ReachabilityProviding
-    private let deliveredNotificationClearer: any DeliveredNotificationClearing
+    // Internal (not private): used by the dismiss-sync extension file.
+    let deliveredNotificationClearer: any DeliveredNotificationClearing
     /// Durable outbox for phone→Mac dismissals (see
     /// ``PendingNotificationDismissQueue``): ids are enqueued before the RPC is
     /// attempted, removed only on confirmed delivery, and re-flushed on every
     /// successful (re)subscribe.
-    private let pendingDismissQueue: PendingNotificationDismissQueue
+    let pendingDismissQueue: PendingNotificationDismissQueue
     private let pairingHintDefaults: UserDefaults
+    // Internal (not private): used by the dismiss-sync and dogfood-feedback
+    // extension files.
     let clientID: String
     /// Delivers the email path of Send Feedback (`/api/feedback`). `nil` when the
     /// web API base URL is unavailable; the email path then fails closed and the
@@ -534,6 +539,8 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// `public` so the DEV feedback-submit affordance can ``DiagnosticLog/export()``
     /// it.
     public let diagnosticLog: DiagnosticLog?
+    // Internal (not private): used by the dismiss-sync and dogfood-feedback
+    // extension files.
     var remoteClient: MobileCoreRPCClient? {
         didSet {
             if remoteClient == nil {
@@ -550,12 +557,14 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// so the dedicated ``dogfood.checklist`` subscription can feed it
     /// agent-pushed checklists. `weak` because the pane window owns the model's
     /// lifetime, not the shell. DEBUG-only.
-    private weak var dogfoodFeedbackModel: DogfoodFeedbackModel?
+    // Internal (not private): used by the dogfood-feedback extension file.
+    weak var dogfoodFeedbackModel: DogfoodFeedbackModel?
     /// The dedicated, durable ``dogfood.checklist`` subscription task. Kept
     /// separate from ``terminalEventListenerTask`` so the render-grid liveness
     /// watchdog's ~9s re-subscribe never tears it down (it does not carry the
     /// checklist topic). DEBUG-only.
-    private var dogfoodChecklistListenerTask: Task<Void, Never>?
+    // Internal (not private): used by the dogfood-feedback extension file.
+    var dogfoodChecklistListenerTask: Task<Void, Never>?
     #endif
     /// The in-flight `mobile.events.subscribe` (reason `start`) ack for the
     /// current listener generation. It runs concurrently with the consumer
@@ -759,7 +768,11 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     }
 
     public static func preview(runtime: (any MobileSyncRuntime)? = nil) -> CMUXMobileShellStore {
-        CMUXMobileShellStore(runtime: runtime, workspaces: PreviewMobileHost.workspaces)
+        CMUXMobileShellStore(
+            runtime: runtime,
+            workspaces: PreviewMobileHost.workspaces,
+            deliveredNotificationClearer: NoopDeliveredNotificationClearer()
+        )
     }
 
     public func signIn() {
@@ -1014,474 +1027,6 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             mobileShellLog.error("click forward failed surface=\(surfaceID, privacy: .public) error=\(String(describing: error), privacy: .public)")
         }
     }
-
-    // MARK: - Workspace actions
-
-    // MARK: - Notification dismiss-sync
-
-    /// Tell the Mac that one or more mirrored notifications were dismissed on
-    /// this phone (a swipe/clear on the delivered banner). The Mac marks them
-    /// read and clears its own banner; its store then emits `notification.dismissed`
-    /// back, which is a harmless no-op for the already-removed phone banner.
-    ///
-    /// Fire-and-forget against the authoritative Mac store, but durable: the ids
-    /// are enqueued in ``PendingNotificationDismissQueue`` BEFORE the RPC is
-    /// attempted and removed only after it succeeds, so a dismiss that races a
-    /// dead/absent attach channel is retried by ``flushPendingNotificationDismisses()``
-    /// on the next successful (re)subscribe instead of being dropped.
-    ///
-    /// Carries only opaque notification UUIDs, never terminal content, so it is
-    /// safe regardless of the Mac's phone-forward hideContent setting.
-    /// - Parameter ids: The stable notification ids the user dismissed.
-    public func dismissNotification(ids: [String]) async {
-        let trimmed = ids
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !trimmed.isEmpty else { return }
-        pendingDismissQueue.enqueue(trimmed)
-        guard let client = remoteClient else { return }
-        do {
-            let request = try MobileCoreRPCClient.requestData(
-                method: "notification.dismiss",
-                params: [
-                    "notification_ids": trimmed,
-                    "client_id": clientID,
-                ]
-            )
-            _ = try await client.sendRequest(request)
-            pendingDismissQueue.remove(trimmed)
-        } catch {
-            // Left in the queue; the next successful (re)subscribe re-sends.
-            mobileShellLog.error("notification dismiss sync failed count=\(trimmed.count, privacy: .public) error=\(String(describing: error), privacy: .public)")
-        }
-    }
-
-    /// Re-send every dismissal still waiting in the durable outbox (a swipe that
-    /// happened while detached, backgrounded, or before any scene existed). The
-    /// Mac ignores ids it does not know, so replaying stale entries is harmless.
-    func flushPendingNotificationDismisses() async {
-        let pending = pendingDismissQueue.pendingIDs
-        guard !pending.isEmpty else { return }
-        await dismissNotification(ids: pending)
-    }
-
-    /// Clear delivered banners on this phone in response to a Mac-side dismiss
-    /// (`notification.dismissed` peer event). The ids are stable Mac-side
-    /// notification ids; the injected ``DeliveredNotificationClearing`` seam
-    /// maps them to the matching delivered banners via their
-    /// `cmux.notificationId` payload key.
-    /// - Parameter ids: The notification ids the Mac dismissed.
-    public func clearDeliveredNotifications(ids: [String]) async {
-        let trimmed = ids
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-        guard !trimmed.isEmpty else { return }
-        await deliveredNotificationClearer.removeDelivered(ids: trimmed)
-    }
-
-    /// SET the app-icon badge to the Mac's authoritative unread total. Always an
-    /// absolute write (never local +/-1 arithmetic) so any drift self-heals on
-    /// the next event, push, or reconcile sweep.
-    /// - Parameter count: The Mac's unread-notification count.
-    public func applyAuthoritativeUnreadBadge(_ count: Int) {
-        deliveredNotificationClearer.setBadgeCount(max(0, count))
-    }
-
-    /// Kick off one foreground/connect dismiss-sync pass against `client`:
-    /// first flush the durable phone→Mac dismiss outbox (so the Mac's store
-    /// reflects every swipe that happened while detached), then run the
-    /// reconcile sweep (lane 3) whose answer therefore already includes them.
-    /// Fire-and-forget; failures are non-fatal because the next (re)subscribe
-    /// runs another pass.
-    private func scheduleNotificationReconcile(client: MobileCoreRPCClient) {
-        Task { [weak self] in
-            await self?.flushPendingNotificationDismisses()
-            await self?.reconcileNotificationsWithMac(client: client)
-        }
-    }
-
-    /// The reconcile sweep: send the Mac the ids of every banner currently
-    /// delivered on this phone; it answers with the subset handled there (read,
-    /// or recently dismissed/removed) plus its authoritative unread count. Remove
-    /// the handled banners and SET the badge. This heals whatever the live event
-    /// lane and the budgeted silent-push lane missed while the app was closed.
-    /// Ids the Mac does not recognize are left alone (they may mirror a
-    /// different paired Mac). Exchanges only opaque ids and a count.
-    func reconcileNotificationsWithMac(client: MobileCoreRPCClient) async {
-        let deliveredIDs = await deliveredNotificationClearer.deliveredIdentifiers()
-        guard remoteClient === client, connectionState == .connected else { return }
-        do {
-            let request = try MobileCoreRPCClient.requestData(
-                method: "notification.reconcile",
-                params: [
-                    "delivered_ids": deliveredIDs,
-                    "client_id": clientID,
-                ]
-            )
-            let data = try await client.sendRequest(request)
-            guard remoteClient === client else { return }
-            let response = try MobileNotificationReconcileResponse.decode(data)
-            await applyNotificationReconcile(response)
-            MobileDebugLog.anchormux(
-                "notif.reconcile delivered=\(deliveredIDs.count) handled=\(response.handledIDs.count) unread=\(response.unreadCount.map(String.init) ?? "nil")"
-            )
-        } catch {
-            // Older Macs don't implement the verb (method_not_found), and
-            // transport hiccups are non-fatal: the next (re)subscribe retries.
-            MobileDebugLog.anchormux("notif.reconcile_failed error=\(error)")
-        }
-    }
-
-    /// Apply a reconcile result: clear the banners the Mac reports handled and
-    /// SET the badge to its authoritative count. Split from the transport so the
-    /// behavior is unit-testable through the injected clearing seam.
-    func applyNotificationReconcile(_ response: MobileNotificationReconcileResponse) async {
-        if !response.handledIDs.isEmpty {
-            await clearDeliveredNotifications(ids: response.handledIDs)
-        }
-        if let unreadCount = response.unreadCount {
-            applyAuthoritativeUnreadBadge(unreadCount)
-        }
-    }
-
-    /// Privileged direct-to-agent feedback round-trip: export the structured
-    /// diagnostic log, package it with the supplied debug-log text, visible
-    /// terminal text, and an optional freeform note, and submit it to the paired
-    /// Mac's `dogfood.feedback.submit` sink so the existing watcher under
-    /// `~/.cache/cmux-dogfood-feedback/` catches it.
-    ///
-    /// This is the privileged path of the Send Feedback feature: it is offered
-    /// only to `@manaflow.ai` users on an active mobile-host connection (see
-    /// ``MobileFeedbackRoute/resolve(email:hasActiveMacConnection:hostSupportsAgentSink:)``), and is NOT
-    /// `#if DEBUG`-gated, so it works on Release (beta/prod) builds for the team.
-    ///
-    /// The structured log is exported here (the store owns ``diagnosticLog``);
-    /// the string snapshots are gathered by the caller on the UI layer, where the
-    /// `GhosttySurfaceView`/`MobileDebugLog` accessors live. Fire-and-forget; a
-    /// transport failure is logged and surfaced via the returned `Bool`.
-    ///
-    /// - Parameters:
-    ///   - text: An optional freeform note from the user.
-    ///   - debugLogText: The string debug-log snapshot (from `MobileDebugLog`).
-    ///   - terminalText: The visible terminal text (from `GhosttySurfaceView`).
-    ///   - answersJSON: The P2 multiple-choice answers as canonical JSON
-    ///     (``CmuxMobileShellModel/DogfoodFeedbackAnswers``), or `nil` for the P1
-    ///     freeform-only path. An old (P1-only) Mac ignores the extra key.
-    ///   - screenshotPNG: The P2 chrome screenshot PNG (the terminal renders
-    ///     blank in a UIView snapshot, which is why the terminal *text* is sent
-    ///     too), or `nil`. Sent base64; an old Mac ignores the extra key.
-    ///   - buildStamp: The build-identity stamp (build type + version + OS +
-    ///     device) written into the bundle. Defaults to the diagnostic log's
-    ///     stamp when not supplied.
-    /// - Returns: `true` when the Mac acknowledged the bundle.
-    @discardableResult
-    public func submitPrivilegedAgentFeedback(
-        text: String,
-        debugLogText: String,
-        terminalText: String,
-        answersJSON: Data? = nil,
-        screenshotPNG: Data? = nil,
-        buildStamp: String? = nil
-    ) async -> Bool {
-        guard let client = remoteClient else { return false }
-        let diagnosticBlob = await diagnosticLog?.export() ?? Data()
-        let buildStamp = buildStamp ?? diagnosticLog?.buildStamp ?? ""
-        let clientID = clientID
-        // Cap inputs and build the (potentially multi-MiB) combined blob +
-        // base64 + JSON request OFF the main actor: the store is `@MainActor`, so
-        // doing the concat/encode here would block the UI on a large bundle. A
-        // detached task returns the finished request bytes (`Data` is `Sendable`).
-        let request: Data?
-        do {
-            request = try await Task.detached(priority: .utility) { () -> Data in
-                try Self.buildDogfoodFeedbackRequest(
-                    text: text,
-                    debugLogText: debugLogText,
-                    terminalText: terminalText,
-                    buildStamp: buildStamp,
-                    clientID: clientID,
-                    diagnosticBlob: diagnosticBlob,
-                    answersJSON: answersJSON,
-                    screenshotPNG: screenshotPNG
-                )
-            }.value
-        } catch {
-            mobileShellLog.error("dogfood feedback encode failed error=\(String(describing: error), privacy: .public)")
-            return false
-        }
-        guard let request else { return false }
-        do {
-            _ = try await client.sendRequest(request)
-            return true
-        } catch {
-            mobileShellLog.error("dogfood feedback submit failed error=\(String(describing: error), privacy: .public)")
-            return false
-        }
-    }
-
-    /// Client-side caps mirroring the Mac sink, applied before any large
-    /// allocation so a huge debug log or note can't be encoded into a multi-MiB
-    /// request on the phone. `nonisolated` so the off-main request builder can
-    /// read them.
-    nonisolated private static let dogfoodFeedbackMaxTextChars = 16_384
-    nonisolated private static let dogfoodFeedbackMaxTerminalChars = 262_144
-    nonisolated private static let dogfoodFeedbackMaxDebugLogChars = 1_048_576
-    /// Drop the answers JSON past this size before attaching it, mirroring the
-    /// Mac sink's `answers_json` cap. The freeform note rides inside the answers
-    /// payload, so without this a pasted multi-MiB note would serialize and ship
-    /// uncapped (the separate `text` field is capped, but the same note is here
-    /// too). 64 KiB matches the Mac's `dogfoodFeedbackMaxAnswersChars`.
-    nonisolated private static let dogfoodFeedbackMaxAnswersBytes = 65_536
-    /// Drop a screenshot larger than this before encoding it, mirroring the Mac
-    /// sink's blob byte cap so a huge PNG can't be base64'd into a multi-MiB
-    /// request on the phone. A dropped screenshot still ships the rest of the
-    /// bundle (text + terminal + answers + diagnostics).
-    nonisolated private static let dogfoodFeedbackMaxScreenshotBytes = 6_291_456 // 6 MiB
-
-    /// Combine the structured + string diagnostics into one self-contained blob,
-    /// base64-encode it, attach the optional P2 answers + screenshot, and build
-    /// the RPC request — all off the main actor.
-    ///
-    /// The string debug log rides inside the same diagnostic file as the compact
-    /// structured rows (rows, a divider, then the human-readable log) so the Mac
-    /// bundle is self-contained. Inputs are size-capped first. The P2 fields are
-    /// added only when present, so a P1 freeform-only submit produces the exact
-    /// same params it did before (and an old Mac ignores the new keys).
-    nonisolated private static func buildDogfoodFeedbackRequest(
-        text: String,
-        debugLogText: String,
-        terminalText: String,
-        buildStamp: String,
-        clientID: String,
-        diagnosticBlob: Data,
-        answersJSON: Data?,
-        screenshotPNG: Data?
-    ) throws -> Data {
-        let cappedText = String(text.prefix(dogfoodFeedbackMaxTextChars))
-        let cappedTerminal = String(terminalText.prefix(dogfoodFeedbackMaxTerminalChars))
-        let cappedDebugLog = String(debugLogText.prefix(dogfoodFeedbackMaxDebugLogChars))
-        var combined = diagnosticBlob
-        if !cappedDebugLog.isEmpty {
-            combined.append(Data("\n----- mobile debug log -----\n".utf8))
-            combined.append(Data(cappedDebugLog.utf8))
-        }
-        var params: [String: Any] = [
-            "text": cappedText,
-            "terminal_text": cappedTerminal,
-            "build_stamp": buildStamp,
-            "diagnostic_blob_base64": combined.base64EncodedString(),
-            "client_id": clientID,
-        ]
-        // Attach the answers JSON, keeping it under the Mac-side cap WITHOUT ever
-        // dropping the structured MC answers (the dogfooder's actual responses).
-        // The freeform note is the only unbounded contributor here, so if the
-        // encoded payload is over the byte cap, re-encode with a shrunk note that
-        // leaves room for the MC rows. The note also ships in the capped `text`
-        // field, so trimming it here loses nothing the bundle does not already
-        // carry. The model already byte-caps the note, so this is a backstop for
-        // a pathologically large agent-pushed checklist.
-        if let answersString = Self.cappedAnswersJSONString(
-            answersJSON,
-            maxBytes: dogfoodFeedbackMaxAnswersBytes
-        ) {
-            params["answers_json"] = answersString
-        }
-        // Attach the screenshot only if the *whole request frame* still fits the
-        // mobile transport's frame limit. The screenshot is the largest and most
-        // droppable field, and the diagnostic blob + terminal text + answers can
-        // already consume much of the budget, so a screenshot that passes its own
-        // byte cap could still push the frame over `defaultMaximumFrameByteCount`
-        // and make the transport throw `frameTooLarge` — failing the whole submit
-        // instead of just dropping the screenshot. So: build the request without
-        // the screenshot first, then re-add it only when the larger request still
-        // fits (with header + margin). This keeps the rest of the bundle shipping
-        // even when the screenshot has to be dropped.
-        let requestWithoutScreenshot = try MobileCoreRPCClient.requestData(
-            method: "dogfood.feedback.submit",
-            params: params
-        )
-        guard let screenshotPNG, screenshotPNG.count <= dogfoodFeedbackMaxScreenshotBytes else {
-            return requestWithoutScreenshot
-        }
-        let screenshotBase64 = screenshotPNG.base64EncodedString()
-        params["screenshot_png_base64"] = screenshotBase64
-        let requestWithScreenshot = try MobileCoreRPCClient.requestData(
-            method: "dogfood.feedback.submit",
-            params: params
-        )
-        let frameBudget = MobileSyncFrameCodec.defaultMaximumFrameByteCount - MobileSyncFrameCodec.headerByteCount
-        if requestWithScreenshot.count <= frameBudget {
-            return requestWithScreenshot
-        }
-        // The screenshot would overflow the frame; ship the rest without it.
-        return requestWithoutScreenshot
-    }
-
-    /// Return the answers JSON as a UTF-8 string capped under `maxBytes`, dropping
-    /// the freeform note (not the structured MC answers) when needed.
-    ///
-    /// The MC answers are the dogfooder's actual responses and must never be lost
-    /// silently, so when the encoded payload is over the cap this re-encodes the
-    /// same answers with an empty note (the note also rides in the capped `text`
-    /// field). Returns `nil` when there is no answers payload, the payload cannot
-    /// be decoded, or even the note-free encoding is still over the cap (a
-    /// pathologically large agent checklist — the structured rows themselves are
-    /// bounded by the Mac's checklist size cap, so this is a defensive backstop).
-    ///
-    /// `internal` (not `private`) so the byte-cap-preserves-answers behavior is
-    /// testable without a live transport.
-    nonisolated static func cappedAnswersJSONString(_ answersJSON: Data?, maxBytes: Int) -> String? {
-        guard let answersJSON else { return nil }
-        if answersJSON.count <= maxBytes {
-            return String(data: answersJSON, encoding: .utf8)
-        }
-        // Over the cap: the note is the only unbounded field. Re-encode keeping
-        // the MC answers but dropping the note.
-        guard let decoded = try? DogfoodFeedbackAnswers.decode(answersJSON) else { return nil }
-        let noteFree = DogfoodFeedbackAnswers(answers: decoded.answers, note: "")
-        guard let reEncoded = try? noteFree.encode(), reEncoded.count <= maxBytes else { return nil }
-        return String(data: reEncoded, encoding: .utf8)
-    }
-
-    // MARK: - Dogfood checklist (P2)
-
-    #if DEBUG
-    /// The event topic the Mac pushes agent checklists on.
-    nonisolated private static let dogfoodChecklistTopic = "dogfood.checklist"
-    /// The capability the Mac advertises when it can push/serve checklists. A
-    /// P1-only Mac omits it, so the phone skips the subscribe + fetch and never
-    /// eats a `method_not_found`.
-    nonisolated private static let dogfoodChecklistCapability = "dogfood.checklist"
-
-    /// Inject the floating pane's model so the dedicated checklist subscription
-    /// can feed it. Called once from the composition root after both are built.
-    /// - Parameter model: The DEV dogfood pane model.
-    public func setDogfoodFeedbackModel(_ model: DogfoodFeedbackModel) {
-        dogfoodFeedbackModel = model
-    }
-
-    private var dogfoodChecklistStreamID: String {
-        "ios-dogfood-checklist-\(clientID)"
-    }
-
-    /// Start the dedicated, durable ``dogfood.checklist`` subscription for the
-    /// active connection, then pull the current checklist once so a checklist the
-    /// agent pushed *before* this device subscribed is not missed (the
-    /// subscribe-after-push race).
-    ///
-    /// This is intentionally separate from ``startTerminalRefreshPolling()``: the
-    /// terminal stream is re-subscribed every ~9s by the render-grid liveness
-    /// watchdog, which would repeatedly drop a topic piggybacked on it. A
-    /// dedicated stream_id + listener coexists with the terminal stream (both the
-    /// client session and the Mac host demux subscriptions by topic / stream_id).
-    private func startDogfoodChecklistSubscription() {
-        guard let client = remoteClient else { return }
-        guard runtime?.supportsServerPushEvents ?? true else { return }
-        guard dogfoodChecklistListenerTask == nil else { return }
-        let topics: Set<String> = [Self.dogfoodChecklistTopic]
-        dogfoodChecklistListenerTask = Task { @MainActor [weak self] in
-            defer { self?.dogfoodChecklistListenerTask = nil }
-            guard let self else { return }
-            // Gate on the Mac advertising the capability so a P1-only Mac is a
-            // no-op (no subscribe, no fetch). The flag is parsed from the host
-            // status the terminal path already resolved; no extra status RPC.
-            guard self.supportsDogfoodChecklist else { return }
-            let stream = await client.subscribe(to: topics)
-            let subscribed = await self.requestDogfoodChecklistSubscription(client: client)
-            guard subscribed else { return }
-            // Close the subscribe-after-push race: pull the current checklist now.
-            await self.fetchDogfoodChecklist(client: client)
-            for await event in stream {
-                guard !Task.isCancelled else { return }
-                guard self.remoteClient === client else { return }
-                if event.topic == Self.dogfoodChecklistTopic {
-                    self.dogfoodFeedbackModel?.applyChecklistPayload(event.payloadJSON)
-                }
-            }
-        }
-    }
-
-    private func stopDogfoodChecklistSubscription() {
-        dogfoodChecklistListenerTask?.cancel()
-        dogfoodChecklistListenerTask = nil
-    }
-
-    /// Register the dedicated checklist subscription with the Mac host. Uses a
-    /// distinct stream_id so it coexists with the terminal subscription.
-    private func requestDogfoodChecklistSubscription(client: MobileCoreRPCClient) async -> Bool {
-        do {
-            let requestData = try MobileCoreRPCClient.requestData(
-                method: "mobile.events.subscribe",
-                params: [
-                    "stream_id": dogfoodChecklistStreamID,
-                    "topics": [Self.dogfoodChecklistTopic],
-                ]
-            )
-            let responseData = try await client.sendRequest(requestData)
-            let response = try? MobileEventSubscribeResponse.decode(responseData)
-            return !(response?.streamID ?? "").isEmpty
-        } catch {
-            mobileShellLog.error("dogfood checklist subscribe failed: \(String(describing: error), privacy: .public)")
-            return false
-        }
-    }
-
-    /// Pull the current checklist via `dogfood.checklist.fetch` and feed it to the
-    /// pane model. Best-effort: a missing/old Mac or an unparseable result is a
-    /// no-op (the subscription still delivers future pushes). A result that
-    /// explicitly reports no checklist (`{"checklist": null}`) clears the pane —
-    /// this is the reconnect/missed-clear recovery path, so a phone that still
-    /// shows a since-cleared checklist gets cleared on the next fetch.
-    private func fetchDogfoodChecklist(client: MobileCoreRPCClient) async {
-        do {
-            let data = try await client.sendRequest(
-                MobileCoreRPCClient.requestData(method: "dogfood.checklist.fetch", params: [:])
-            )
-            switch Self.dogfoodChecklistFetchResult(from: data) {
-            case .present(let payload):
-                dogfoodFeedbackModel?.applyChecklistPayload(payload)
-            case .cleared:
-                dogfoodFeedbackModel?.applyChecklist(.empty)
-            case .unparseable:
-                break
-            }
-        } catch {
-            mobileShellLog.error("dogfood checklist fetch failed: \(String(describing: error), privacy: .public)")
-        }
-    }
-
-    /// The three outcomes of parsing a `dogfood.checklist.fetch` result.
-    private enum DogfoodChecklistFetchResult {
-        /// A checklist object was present; carries its re-serialized JSON.
-        case present(Data)
-        /// The Mac explicitly reported no checklist (`{"checklist": null}`).
-        case cleared
-        /// The result could not be parsed; the caller should leave state as-is.
-        case unparseable
-    }
-
-    /// Classify a `dogfood.checklist.fetch` result.
-    ///
-    /// ``MobileCoreRPCClient/sendRequest(_:timeoutNanoseconds:)`` already unwraps
-    /// the JSON-RPC envelope and returns only the `result` object, so the data
-    /// here is `{"checklist": {...}}` (a checklist) or `{"checklist": null}` (no
-    /// checklist), not a nested `{"result": …}`. A present `checklist` object is
-    /// re-serialized for the typed decoder; an explicit `null` (or absent key on
-    /// a well-formed result) is a `cleared` signal; anything else is
-    /// `unparseable`.
-    nonisolated private static func dogfoodChecklistFetchResult(from data: Data) -> DogfoodChecklistFetchResult {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            return .unparseable
-        }
-        if let checklist = root["checklist"] as? [String: Any],
-           let reSerialized = try? JSONSerialization.data(withJSONObject: checklist) {
-            return .present(reSerialized)
-        }
-        // A well-formed result whose `checklist` is null/absent means the Mac has
-        // no checklist set: clear the pane.
-        return .cleared
-    }
-    #endif
 
     // MARK: - Feedback routing
 
@@ -4599,6 +4144,11 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                 topics: topics,
                 transport: outputTransport
             )
+            // Lane 3 of dismiss-sync: every (re)subscribe — initial connect,
+            // app foreground, network recovery, liveness restart — runs one
+            // reconcile sweep so banners/badge heal anything missed while the
+            // app was closed or detached.
+            self?.scheduleNotificationReconcile(client: client)
             // Lane 3 of dismiss-sync: every (re)subscribe — initial connect,
             // app foreground, network recovery, liveness restart — runs one
             // reconcile sweep so banners/badge heal anything missed while the

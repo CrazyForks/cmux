@@ -21,7 +21,8 @@ final class RecordingURLProtocol: URLProtocol, @unchecked Sendable {
             host: host,
             method: method,
             path: request.url?.path ?? "",
-            body: bodyData
+            body: bodyData,
+            headers: request.allHTTPHeaderFields ?? [:]
         )
         // Snapshot the canned response synchronously so the response is ready
         // before this loader finishes (the recorder actor read is deferred).
@@ -106,6 +107,9 @@ struct RecordedRequest: Sendable {
     let method: String
     let path: String
     let body: Data?
+    /// Request headers, for asserting which credentials authenticated a call
+    /// (e.g. the sign-out DELETE's captured Bearer pair).
+    let headers: [String: String]
 }
 
 /// The recorder is process-global because `URLProtocol` has no per-session hook,
@@ -616,7 +620,7 @@ struct FakeTokenProvider: TokenProviding {
         // push-token DELETE runs, so the captured pair must authenticate the
         // request on its own (the provider would return nothing and the DELETE
         // used to be silently skipped).
-        let (service, _) = makeService(
+        let (service, _, _) = makeService(
             tokenProvider: FakeTokenProvider(access: nil, refresh: nil)
         )
         await service.register(deviceToken: Data([0xAB, 0xCD]))
@@ -628,15 +632,15 @@ struct FakeTokenProvider: TokenProviding {
 
         // The recorder is shared by parallel tests; select this test's request
         // by its unique captured credential instead of taking the first one.
-        var request: URLRequest?
+        var request: RecordedRequest?
         for _ in 0..<1000 where request == nil {
             request = await RecordingURLProtocol.recorder.requests.first {
-                $0.value(forHTTPHeaderField: "Authorization") == "Bearer captured-access"
+                $0.headers["Authorization"] == "Bearer captured-access"
             }
             await Task.yield()
         }
-        #expect(request?.httpMethod == "DELETE")
-        #expect(request?.value(forHTTPHeaderField: "X-Stack-Refresh-Token") == "captured-refresh")
+        #expect(request?.method == "DELETE")
+        #expect(request?.headers["X-Stack-Refresh-Token"] == "captured-refresh")
     }
 
     @Test func signOutUnregisterNeverFallsBackToLiveProvider() async {
@@ -646,7 +650,7 @@ struct FakeTokenProvider: TokenProviding {
         // than fall back to the live provider: a sign-in racing the bounded
         // teardown can repopulate the provider with the NEXT account's
         // tokens, and the DELETE would then unregister the wrong account.
-        let (service, _) = makeService(
+        let (service, _, _) = makeService(
             tokenProvider: FakeTokenProvider(access: "next-user-access", refresh: "next-user-refresh")
         )
         await service.register(deviceToken: Data([0xEE, 0xFF]))
@@ -656,7 +660,7 @@ struct FakeTokenProvider: TokenProviding {
         // The unregister call has fully completed, so any DELETE it issued is
         // already recorded. None may carry the live (next account's) Bearer.
         let hijacked = await RecordingURLProtocol.recorder.requests.contains {
-            $0.value(forHTTPHeaderField: "Authorization") == "Bearer next-user-access"
+            $0.headers["Authorization"] == "Bearer next-user-access"
         }
         #expect(hijacked == false)
     }
